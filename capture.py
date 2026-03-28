@@ -75,14 +75,14 @@ BASE_URL = (
     "https://api.tomtom.com/map/1/tile/basic/main"
     "/{z}/{x}/{y}.png?tileSize={ts}&key={key}"
 )
+# thickness=2 → lignes fines comme plan.tomtom.com (défaut API = 10, beaucoup trop épais)
 FLOW_URL = (
     "https://api.tomtom.com/traffic/map/4/tile/flow/relative"
-    "/{z}/{x}/{y}.png?tileSize={ts}&key={key}"
+    "/{z}/{x}/{y}.png?tileSize={ts}&thickness=2&key={key}"
 )
-# Les tuiles incidents ne supportent pas tileSize → 256×256 par défaut
-# Elles seront upscalées à 512 lors du compositing
+# Style s1 → petits marqueurs propres (s3 = grosses zones grises illisibles)
 INCIDENTS_URL = (
-    "https://api.tomtom.com/traffic/map/4/tile/incidents/s3"
+    "https://api.tomtom.com/traffic/map/4/tile/incidents/s1"
     "/{z}/{x}/{y}.png?key={key}"
 )
 
@@ -128,11 +128,13 @@ def parse_tomtom_url(url: str) -> dict:
       - https://plan.tomtom.com/?p=46.68973,8.93561,8.55z
       - https://plan.tomtom.com/en/?p=46.68973,8.93561,8z
 
-    Le zoom est arrondi à l'entier le plus proche (l'API tuiles
-    n'accepte que des zooms entiers).
+    Le zoom fractionnaire est conservé pour calculer la couverture géographique
+    exacte. L'API utilise le zoom entier supérieur (ceil) pour les tuiles,
+    et le viewport est élargi proportionnellement puis redimensionné pour
+    reproduire la même vue que plan.tomtom.com.
 
     Returns:
-        {"lat": float, "lon": float, "zoom": int}
+        {"lat": float, "lon": float, "zoom": int, "zoom_frac": float}
     """
     # Extraire le paramètre 'p' de l'URL
     parsed = urlparse(url)
@@ -155,19 +157,20 @@ def parse_tomtom_url(url: str) -> dict:
             f"  Attendu: lat,lon,zoomz (ex: 46.68973,8.93561,8.55z)"
         )
 
-    lat  = float(match.group(1))
-    lon  = float(match.group(2))
-    zoom = round(float(match.group(3)))  # Arrondi à l'entier le plus proche
+    lat      = float(match.group(1))
+    lon      = float(match.group(2))
+    zoom_frac = float(match.group(3))
+    zoom     = round(zoom_frac)   # Zoom entier pour l'API
 
     # Validation
     if not (-90 <= lat <= 90):
         raise ValueError(f"Latitude hors limites: {lat}")
     if not (-180 <= lon <= 180):
         raise ValueError(f"Longitude hors limites: {lon}")
-    if not (0 <= zoom <= 22):
-        raise ValueError(f"Zoom hors limites: {zoom} (doit être entre 0 et 22)")
+    if not (0 <= zoom_frac <= 22):
+        raise ValueError(f"Zoom hors limites: {zoom_frac} (doit être entre 0 et 22)")
 
-    return {"lat": lat, "lon": lon, "zoom": zoom}
+    return {"lat": lat, "lon": lon, "zoom": zoom, "zoom_frac": zoom_frac}
 
 
 def parse_zone_config(value) -> dict:
@@ -337,6 +340,11 @@ def capture_zone(name: str, config: dict) -> int:
     """
     Capture complète d'une zone : télécharge 3 couches, compose, sauvegarde.
 
+    Pour les zooms fractionnaires (ex: 8.55z), on utilise le zoom entier
+    supérieur (9) pour les tuiles, mais on élargit le viewport pour couvrir
+    la même zone géographique que plan.tomtom.com, puis on redimensionne
+    au format final 1920×1080.
+
     Returns:
         Nombre de tuiles utilisées (pour le suivi du budget)
     """
@@ -345,6 +353,17 @@ def capture_zone(name: str, config: dict) -> int:
     time_str = now.strftime("%H%M")
 
     lat, lon, zoom = config["lat"], config["lon"], config["zoom"]
+    zoom_frac = config.get("zoom_frac", float(zoom))
+
+    # Facteur d'expansion pour compenser le zoom entier vs fractionnaire
+    # Appliqué uniquement quand le zoom a été arrondi VERS LE HAUT
+    # (8.55→9 : expand / 12.17→12 : pas d'expand, différence négligeable)
+    if zoom > zoom_frac:
+        scale_factor = 2 ** (zoom - zoom_frac)
+    else:
+        scale_factor = 1.0
+    fetch_width  = round(VIEWPORT_WIDTH * scale_factor)
+    fetch_height = round(VIEWPORT_HEIGHT * scale_factor)
 
     # Dossier de sortie
     zone_dir = OUTPUT_DIR / date_str / name
@@ -353,10 +372,15 @@ def capture_zone(name: str, config: dict) -> int:
 
     print(f"\n{'='*60}")
     print(f"[{name}] {now.strftime('%Y-%m-%d %H:%M %Z')}")
-    print(f"[{name}] zoom={zoom}  center=({lat:.5f}, {lon:.5f})")
+    if scale_factor > 1.01:
+        print(f"[{name}] zoom={zoom_frac}→{zoom}  scale={scale_factor:.2f}x"
+              f"  fetch={fetch_width}×{fetch_height}→{VIEWPORT_WIDTH}×{VIEWPORT_HEIGHT}")
+    else:
+        print(f"[{name}] zoom={zoom}  center=({lat:.5f}, {lon:.5f})")
 
-    # Calculer la grille de tuiles
-    x0, y0, x1, y1, off_x, off_y = get_tile_grid(lat, lon, zoom)
+    # Calculer la grille de tuiles (avec viewport élargi)
+    x0, y0, x1, y1, off_x, off_y = get_tile_grid(
+        lat, lon, zoom, fetch_width, fetch_height)
     tile_coords = [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
     n_tiles = len(tile_coords)
     print(f"[{name}] Grille: {x1-x0+1}×{y1-y0+1} = {n_tiles} tuiles/couche"
@@ -407,8 +431,13 @@ def capture_zone(name: str, config: dict) -> int:
     composite = Image.alpha_composite(base_layer, flow_layer)
     composite = Image.alpha_composite(composite, incident_layer)
 
-    # Découper au viewport exact
-    cropped = composite.crop((off_x, off_y, off_x + VIEWPORT_WIDTH, off_y + VIEWPORT_HEIGHT))
+    # Découper au viewport élargi
+    cropped = composite.crop((off_x, off_y, off_x + fetch_width, off_y + fetch_height))
+
+    # Redimensionner au format final (compense le zoom fractionnaire)
+    if scale_factor > 1.01:
+        cropped = cropped.resize(
+            (VIEWPORT_WIDTH, VIEWPORT_HEIGHT), Image.LANCZOS)
 
     # Sauvegarder en JPEG
     final = cropped.convert("RGB")
@@ -479,7 +508,10 @@ if __name__ == "__main__":
         try:
             config = parse_zone_config(value)
             parsed_zones[name] = config
-            print(f"  ✓ {name}: lat={config['lat']:.5f} lon={config['lon']:.5f} zoom={config['zoom']}")
+            z_info = f"zoom={config['zoom']}"
+            if config.get('zoom_frac', config['zoom']) != config['zoom']:
+                z_info = f"zoom={config['zoom_frac']}→{config['zoom']}"
+            print(f"  ✓ {name}: lat={config['lat']:.5f} lon={config['lon']:.5f} {z_info}")
         except Exception as e:
             print(f"  ✗ {name}: {e}")
 
