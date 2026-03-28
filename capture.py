@@ -521,12 +521,21 @@ def render_incidents(incidents, lat, lon, zoom, width, height):
 # =============================================================================
 
 def capture_zone(name, config, base_map_path):
-    """Superpose flow + incidents sur la carte de base Playwright."""
+    """
+    Superpose flow + incidents sur la carte de base Playwright.
+
+    Alignement clé : Playwright capture à zoom fractionnaire (ex: 9.75z).
+    Les tuiles flow sont au zoom entier (10). Pour aligner :
+      1. Calculer la zone géographique vue par Playwright à 9.75z/1920×1080
+      2. Chercher les tuiles flow couvrant cette même zone (plus large à zoom 10)
+      3. Redimensionner le résultat à 1920×1080
+    """
     now = datetime.now(TIMEZONE)
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H%M")
 
     lat, lon, zoom = config["lat"], config["lon"], config["zoom"]
+    zoom_frac = config.get("zoom_frac", float(zoom))
 
     zone_dir = OUTPUT_DIR / date_str / name
     zone_dir.mkdir(parents=True, exist_ok=True)
@@ -534,20 +543,38 @@ def capture_zone(name, config, base_map_path):
 
     print(f"\n[{name}] {now.strftime('%H:%M %Z')}")
 
+    # ── Calcul de l'étendue géographique du screenshot Playwright ──
+    # Playwright rend à zoom_frac dans un viewport 1920×1080.
+    # À zoom fractionnaire, l'étendue géo est plus large que zoom entier.
+    # Facteur d'expansion : combien de pixels faut-il au zoom entier
+    # pour couvrir la même zone géographique que zoom_frac.
+    expand = 2 ** (zoom - zoom_frac)  # >1 si arrondi haut, <1 si arrondi bas
+    fetch_w = round(VIEWPORT_WIDTH * expand)
+    fetch_h = round(VIEWPORT_HEIGHT * expand)
+    needs_resize = abs(expand - 1.0) > 0.01
+
+    if needs_resize:
+        print(f"  zoom={zoom_frac}→{zoom}  expand={expand:.3f}  "
+              f"fetch={fetch_w}×{fetch_h}→{VIEWPORT_WIDTH}×{VIEWPORT_HEIGHT}")
+
     # Charger la carte de base
     base = Image.open(base_map_path).convert("RGBA")
 
-    # Flow tiles
-    flow_layer, n_tiles = build_flow_layer(lat, lon, zoom,
-                                            VIEWPORT_WIDTH, VIEWPORT_HEIGHT)
+    # ── Flow tiles (étendue ajustée puis redimensionnée) ──
+    flow_layer, n_tiles = build_flow_layer(lat, lon, zoom, fetch_w, fetch_h)
+    if needs_resize:
+        flow_layer = flow_layer.resize(
+            (VIEWPORT_WIDTH, VIEWPORT_HEIGHT), Image.LANCZOS)
 
-    # Incidents
-    bbox = get_viewport_bbox(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT)
+    # ── Incidents (bbox ajustée, dessinés puis redimensionnés) ──
+    bbox = get_viewport_bbox(lat, lon, zoom, fetch_w, fetch_h)
     incidents = fetch_incidents(bbox)
-    inc_layer = render_incidents(incidents, lat, lon, zoom,
-                                 VIEWPORT_WIDTH, VIEWPORT_HEIGHT)
+    inc_layer = render_incidents(incidents, lat, lon, zoom, fetch_w, fetch_h)
+    if needs_resize:
+        inc_layer = inc_layer.resize(
+            (VIEWPORT_WIDTH, VIEWPORT_HEIGHT), Image.LANCZOS)
 
-    # Composite : base → flow → incidents
+    # ── Composite : base → flow → incidents ──
     composite = Image.alpha_composite(base, flow_layer)
     composite = Image.alpha_composite(composite, inc_layer)
 
