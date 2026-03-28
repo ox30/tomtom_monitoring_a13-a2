@@ -1,27 +1,19 @@
 """
 TomTom Traffic Capture via API — GitHub Actions
 ================================================
-Capture des zones configurées via l'API TomTom (tuiles raster).
+Couches superposées :
+  1. Carte de base       — Map Display API (tuiles raster)
+  2. Traffic Flow        — Traffic API Raster Flow Tiles
+  3. Traffic Incidents   — Incident Details API v5 (dessin vectoriel Pillow)
 
-Approche :
-  1. Télécharge les tuiles carte de base  (Map Display API)
-  2. Télécharge les tuiles traffic flow    (Traffic API — Raster Flow)
-  3. Télécharge les tuiles incidents        (Traffic API — Raster Incidents)
-  4. Superpose les 3 couches (base → flow → incidents)
-  5. Découpe au viewport 1920×1080 → JPEG
-
-Avantages vs web scraping (Playwright) :
-  - Pas de Chromium (10× plus rapide, 50× plus léger)
-  - Résultat déterministe et reproductible
-  - Plus de gestion de popups/cookies/modals
-  - Utilise les free tiles TomTom (50'000/jour)
-
-Budget tuiles (10 min, 3 zones, 3 couches) :
-  ~108 tuiles/capture × 144 captures/jour = ~15'500 tuiles/jour
+La couche incidents est dessinée en lignes pointillées fines
+pour reproduire fidèlement le rendu de plan.tomtom.com :
+  - Rouge = fermetures de route (Road Closed, iconCategory 8)
+  - Gris  = tous les autres incidents
 
 Horodatage : Europe/Zurich (CET/CEST)
 Structure  : captures/YYYY-MM-DD/zone_name/YYYY-MM-DD-HHMM_zone_name.jpg
-Rétention  : 7 jours (configurable)
+Rétention  : 7 jours
 """
 
 import math
@@ -34,11 +26,11 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 from zoneinfo import ZoneInfo
 
 import requests
-from PIL import Image
+from PIL import Image, ImageDraw
 
 # =============================================================================
 # CONFIGURATION
@@ -46,15 +38,7 @@ from PIL import Image
 
 API_KEY = os.environ.get("TOMTOM_API_KEY", "")
 
-# Zones de capture — collez directement l'URL de plan.tomtom.com
-# Le système extrait automatiquement lat, lon et zoom depuis l'URL.
-#
-# Pour ajouter une zone :
-#   1. Aller sur https://plan.tomtom.com
-#   2. Naviguer/zoomer sur la zone souhaitée
-#   3. Copier l'URL du navigateur
-#   4. Ajouter une entrée ci-dessous : "nom_zone": "URL"
-#
+# Zones — collez directement l'URL de plan.tomtom.com
 ZONES = {
     "zone_globale_A2_A13": "https://plan.tomtom.com/en/?p=46.68973,8.93561,8.55z",
     "zone_A13_Chur":       "https://plan.tomtom.com/en/?p=46.89942,9.32459,9.75z",
@@ -63,135 +47,86 @@ ZONES = {
 
 VIEWPORT_WIDTH  = 1920
 VIEWPORT_HEIGHT = 1080
-TILE_SIZE       = 512          # 512×512 px (meilleure qualité, moins de requêtes)
+TILE_SIZE       = 512
 
 OUTPUT_DIR     = Path("captures")
 CACHE_DIR      = Path(".tile-cache")
 TIMEZONE       = ZoneInfo("Europe/Zurich")
 RETENTION_DAYS = 7
 
-# Endpoints TomTom API
+# Endpoints
 BASE_URL = (
     "https://api.tomtom.com/map/1/tile/basic/main"
     "/{z}/{x}/{y}.png?tileSize={ts}&key={key}"
 )
-# thickness=2 → lignes fines comme plan.tomtom.com (défaut API = 10, beaucoup trop épais)
 FLOW_URL = (
     "https://api.tomtom.com/traffic/map/4/tile/flow/relative"
     "/{z}/{x}/{y}.png?tileSize={ts}&thickness=2&key={key}"
 )
-# Style s1 → petits marqueurs propres (s3 = grosses zones grises illisibles)
-INCIDENTS_URL = (
-    "https://api.tomtom.com/traffic/map/4/tile/incidents/s1"
-    "/{z}/{x}/{y}.png?key={key}"
-)
+INCIDENTS_API = "https://api.tomtom.com/traffic/services/5/incidentDetails"
+
+# Dessin incidents
+COLOR_CLOSED = (200, 30, 30, 220)       # Rouge — fermetures totales
+COLOR_OTHER  = (120, 120, 120, 200)     # Gris — autres incidents
+LINE_WIDTH   = 3
+DASH_ON      = 8
+DASH_OFF     = 6
 
 MAX_RETRIES     = 2
 REQUEST_TIMEOUT = 15
-MAX_WORKERS     = 8            # Requêtes parallèles
+MAX_WORKERS     = 8
 
 # =============================================================================
-# COMPTEUR DE TUILES (suivi du budget API)
+# COMPTEUR API
 # =============================================================================
 
-class TileCounter:
-    """Compteur simple pour suivre l'utilisation de l'API."""
+class ApiCounter:
     def __init__(self):
-        self.fetched = 0    # Tuiles téléchargées (API calls réels)
-        self.cached  = 0    # Tuiles servies depuis le cache
-
-    def add_fetch(self):
-        self.fetched += 1
-
-    def add_cache(self):
-        self.cached += 1
-
-    @property
-    def total(self):
-        return self.fetched + self.cached
+        self.tiles_fetched = 0
+        self.tiles_cached  = 0
+        self.nontile_calls = 0
 
     def __str__(self):
-        return f"API={self.fetched} cache={self.cached} total={self.total}"
+        t = self.tiles_fetched + self.tiles_cached
+        return (f"Tuiles: API={self.tiles_fetched} cache={self.tiles_cached} "
+                f"total={t}  |  Non-tuile: {self.nontile_calls}")
 
-counter = TileCounter()
+counter = ApiCounter()
 
 # =============================================================================
-# PARSEUR D'URL plan.tomtom.com
+# PARSEUR URL
 # =============================================================================
 
 def parse_tomtom_url(url: str) -> dict:
-    """
-    Extrait lat, lon, zoom depuis une URL plan.tomtom.com.
-
-    Formats supportés :
-      - https://plan.tomtom.com/en/?p=46.68973,8.93561,8.55z
-      - https://plan.tomtom.com/?p=46.68973,8.93561,8.55z
-      - https://plan.tomtom.com/en/?p=46.68973,8.93561,8z
-
-    Le zoom fractionnaire est conservé pour calculer la couverture géographique
-    exacte. L'API utilise le zoom entier supérieur (ceil) pour les tuiles,
-    et le viewport est élargi proportionnellement puis redimensionné pour
-    reproduire la même vue que plan.tomtom.com.
-
-    Returns:
-        {"lat": float, "lon": float, "zoom": int, "zoom_frac": float}
-    """
-    # Extraire le paramètre 'p' de l'URL
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
+    p_value = params.get("p", [None])[0]
+    if not p_value:
+        m = re.search(r"p=([^&]+)", url)
+        if not m:
+            raise ValueError(f"Paramètre 'p=' introuvable: {url}")
+        p_value = m.group(1)
 
-    if "p" in params:
-        p_value = params["p"][0]
-    else:
-        # Fallback : chercher le pattern directement dans l'URL
-        match = re.search(r"p=([^&]+)", url)
-        if not match:
-            raise ValueError(f"Impossible de trouver le paramètre 'p=' dans l'URL: {url}")
-        p_value = match.group(1)
+    m = re.match(r"^(-?[\d.]+),(-?[\d.]+),([\d.]+)z?$", p_value)
+    if not m:
+        raise ValueError(f"Format inattendu: p='{p_value}'")
 
-    # Parser "lat,lon,zoomz" — le 'z' final indique le zoom
-    match = re.match(r"^(-?[\d.]+),(-?[\d.]+),([\d.]+)z?$", p_value)
-    if not match:
-        raise ValueError(
-            f"Format inattendu pour le paramètre p='{p_value}'\n"
-            f"  Attendu: lat,lon,zoomz (ex: 46.68973,8.93561,8.55z)"
-        )
-
-    lat      = float(match.group(1))
-    lon      = float(match.group(2))
-    zoom_frac = float(match.group(3))
-    zoom     = round(zoom_frac)   # Zoom entier pour l'API
-
-    # Validation
-    if not (-90 <= lat <= 90):
-        raise ValueError(f"Latitude hors limites: {lat}")
-    if not (-180 <= lon <= 180):
-        raise ValueError(f"Longitude hors limites: {lon}")
-    if not (0 <= zoom_frac <= 22):
-        raise ValueError(f"Zoom hors limites: {zoom_frac} (doit être entre 0 et 22)")
+    lat       = float(m.group(1))
+    lon       = float(m.group(2))
+    zoom_frac = float(m.group(3))
+    zoom      = round(zoom_frac)
 
     return {"lat": lat, "lon": lon, "zoom": zoom, "zoom_frac": zoom_frac}
 
 
 def parse_zone_config(value) -> dict:
-    """
-    Accepte soit une URL (str), soit un dict {lat, lon, zoom} déjà parsé.
-    Permet de mixer les deux formats dans ZONES si besoin.
-    """
-    if isinstance(value, str):
-        return parse_tomtom_url(value)
-    elif isinstance(value, dict):
-        return value
-    else:
-        raise TypeError(f"Zone config invalide: {type(value)} — attendu str (URL) ou dict")
-
+    return parse_tomtom_url(value) if isinstance(value, str) else value
 
 # =============================================================================
-# CALCULS TUILES (Spherical Mercator — EPSG:3857)
+# GÉOMÉTRIE TUILES (Spherical Mercator)
 # =============================================================================
 
-def lat_lon_to_tile(lat: float, lon: float, zoom: int) -> tuple[float, float]:
-    """Convertit lat/lon → coordonnées de tuile fractionnaires au zoom donné."""
+def lat_lon_to_tile(lat, lon, zoom):
     n = 2 ** zoom
     x = (lon + 180.0) / 360.0 * n
     lat_rad = math.radians(lat)
@@ -199,155 +134,204 @@ def lat_lon_to_tile(lat: float, lon: float, zoom: int) -> tuple[float, float]:
     return x, y
 
 
-def get_tile_grid(
-    lat: float, lon: float, zoom: int,
-    width: int = VIEWPORT_WIDTH,
-    height: int = VIEWPORT_HEIGHT,
-    tile_size: int = TILE_SIZE,
-) -> tuple[int, int, int, int, int, int]:
-    """
-    Calcule la grille de tuiles nécessaire pour couvrir le viewport.
+def lat_lon_to_pixel(lat, lon, zoom, ts=TILE_SIZE):
+    tx, ty = lat_lon_to_tile(lat, lon, zoom)
+    return tx * ts, ty * ts
 
-    Retourne:
-        (x_start, y_start, x_end, y_end, offset_x, offset_y)
-        - x/y_start..end : indices de tuiles (inclus)
-        - offset_x/y     : pixels à rogner en haut-gauche pour centrer
-    """
+
+def tile_to_lat_lon(tx, ty, zoom):
+    n = 2 ** zoom
+    lon = tx / n * 360.0 - 180.0
+    lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * ty / n))))
+    return lat, lon
+
+
+def get_tile_grid(lat, lon, zoom, width=VIEWPORT_WIDTH, height=VIEWPORT_HEIGHT):
     cx, cy = lat_lon_to_tile(lat, lon, zoom)
+    cpx, cpy = cx * TILE_SIZE, cy * TILE_SIZE
+    tl_px, tl_py = cpx - width / 2, cpy - height / 2
 
-    # Position du centre en pixels dans l'espace global des tuiles
-    cpx = cx * tile_size
-    cpy = cy * tile_size
+    x0 = int(math.floor(tl_px / TILE_SIZE))
+    y0 = int(math.floor(tl_py / TILE_SIZE))
+    x1 = int(math.floor((tl_px + width - 1) / TILE_SIZE))
+    y1 = int(math.floor((tl_py + height - 1) / TILE_SIZE))
+    off_x = int(tl_px - x0 * TILE_SIZE)
+    off_y = int(tl_py - y0 * TILE_SIZE)
 
-    # Coin supérieur-gauche du viewport
-    tl_px = cpx - width / 2
-    tl_py = cpy - height / 2
+    mx = 2 ** zoom - 1
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(mx, x1), min(mx, y1)
 
-    # Indices de tuiles (inclusifs)
-    x_start = int(math.floor(tl_px / tile_size))
-    y_start = int(math.floor(tl_py / tile_size))
-    x_end   = int(math.floor((tl_px + width - 1) / tile_size))
-    y_end   = int(math.floor((tl_py + height - 1) / tile_size))
+    return x0, y0, x1, y1, off_x, off_y
 
-    # Offset pixel pour le crop final
-    offset_x = int(tl_px - x_start * tile_size)
-    offset_y = int(tl_py - y_start * tile_size)
 
-    # Clamp aux limites de la grille
-    max_tile = 2 ** zoom - 1
-    x_start = max(0, x_start)
-    y_start = max(0, y_start)
-    x_end   = min(max_tile, x_end)
-    y_end   = min(max_tile, y_end)
-
-    return x_start, y_start, x_end, y_end, offset_x, offset_y
+def get_viewport_bbox(lat, lon, zoom, width, height):
+    cx, cy = lat_lon_to_tile(lat, lon, zoom)
+    hw, hh = width / (2 * TILE_SIZE), height / (2 * TILE_SIZE)
+    lat_tl, lon_tl = tile_to_lat_lon(cx - hw, cy - hh, zoom)
+    lat_br, lon_br = tile_to_lat_lon(cx + hw, cy + hh, zoom)
+    return (lon_tl, lat_br, lon_br, lat_tl)
 
 # =============================================================================
-# TÉLÉCHARGEMENT DES TUILES
+# TÉLÉCHARGEMENT TUILES
 # =============================================================================
 
 session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(
-    pool_connections=MAX_WORKERS,
-    pool_maxsize=MAX_WORKERS,
-    max_retries=0,  # On gère les retries manuellement
-)
-session.mount("https://", adapter)
-session.headers.update({"User-Agent": "TomTomCapture/2.0"})
+_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS, max_retries=0)
+session.mount("https://", _adapter)
+session.headers["User-Agent"] = "TomTomCapture/2.0"
 
 
-def fetch_tile(url: str, cache_key: str | None = None) -> Image.Image:
-    """
-    Télécharge une tuile PNG depuis l'API TomTom.
-
-    Args:
-        url:       URL complète de la tuile
-        cache_key: Chemin relatif dans CACHE_DIR (None = pas de cache)
-
-    Returns:
-        Image RGBA (tuile transparente en cas d'échec)
-    """
-    # Vérifier le cache
+def fetch_tile(url, cache_key=None):
     if cache_key:
-        cache_path = CACHE_DIR / cache_key
-        if cache_path.exists():
-            counter.add_cache()
-            return Image.open(cache_path).convert("RGBA")
+        cp = CACHE_DIR / cache_key
+        if cp.exists():
+            counter.tiles_cached += 1
+            return Image.open(cp).convert("RGBA")
 
-    # Télécharger avec retry
     for attempt in range(MAX_RETRIES + 1):
         try:
             r = session.get(url, timeout=REQUEST_TIMEOUT)
             r.raise_for_status()
             img = Image.open(BytesIO(r.content)).convert("RGBA")
-            counter.add_fetch()
-
-            # Sauvegarder en cache si demandé
+            counter.tiles_fetched += 1
             if cache_key:
-                cache_path = CACHE_DIR / cache_key
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                img.save(str(cache_path), "PNG")
-
+                cp = CACHE_DIR / cache_key
+                cp.parent.mkdir(parents=True, exist_ok=True)
+                img.save(str(cp), "PNG")
             return img
-
         except Exception as e:
             if attempt < MAX_RETRIES:
                 time.sleep(1.5 * (attempt + 1))
             else:
-                print(f"    ✗ Tuile échouée après {MAX_RETRIES+1} tentatives: {e}")
-                counter.add_fetch()  # On compte quand même l'appel API
+                print(f"    ✗ Tuile échouée: {e}")
+                counter.tiles_fetched += 1
                 return Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0, 0, 0, 0))
 
-    # Ne devrait jamais arriver
     return Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0, 0, 0, 0))
 
 # =============================================================================
-# ASSEMBLAGE DES COUCHES
+# INCIDENTS — API v5 + DESSIN VECTORIEL
 # =============================================================================
 
-def build_layer(
-    tiles: dict[tuple[int, int], Image.Image],
-    x_start: int, y_start: int,
-    x_end: int, y_end: int,
-    target_size: int = TILE_SIZE,
-) -> Image.Image:
-    """
-    Assemble les tuiles en une image unique.
-    Redimensionne automatiquement les tuiles qui ne font pas target_size
-    (cas des tuiles incidents en 256×256).
-    """
-    cols = x_end - x_start + 1
-    rows = y_end - y_start + 1
-    canvas = Image.new("RGBA", (cols * target_size, rows * target_size), (0, 0, 0, 0))
+def fetch_incidents(bbox):
+    """Appelle Incident Details API v5, retourne [{coords, closed}]."""
+    min_lon, min_lat, max_lon, max_lat = bbox
+    fields = "{incidents{type,geometry{type,coordinates},properties{iconCategory}}}"
+    url = (f"{INCIDENTS_API}?key={API_KEY}"
+           f"&bbox={min_lon},{min_lat},{max_lon},{max_lat}"
+           f"&fields={quote(fields, safe='{}(),')}"
+           f"&language=en-GB&timeValidityFilter=present")
 
-    for (tx, ty), img in tiles.items():
-        px = (tx - x_start) * target_size
-        py = (ty - y_start) * target_size
+    try:
+        r = session.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        counter.nontile_calls += 1
+        data = r.json()
+    except Exception as e:
+        print(f"    ✗ Incident Details API: {e}")
+        counter.nontile_calls += 1
+        return []
 
-        # Redimensionner si nécessaire (tuiles incidents = 256×256)
-        if img.size[0] != target_size or img.size[1] != target_size:
-            img = img.resize((target_size, target_size), Image.LANCZOS)
+    incidents = []
+    for inc in data.get("incidents", []):
+        geom = inc.get("geometry", {})
+        props = inc.get("properties", {})
+        closed = (props.get("iconCategory") == 8)
+        gtype = geom.get("type", "")
+        coords = geom.get("coordinates", [])
 
-        canvas.paste(img, (px, py))
+        if gtype == "LineString" and coords:
+            incidents.append({"coords": coords, "closed": closed})
+        elif gtype == "MultiLineString":
+            for line in coords:
+                if line:
+                    incidents.append({"coords": line, "closed": closed})
+    return incidents
 
+
+def draw_dashed_line(draw, points, color, width=LINE_WIDTH,
+                     dash_on=DASH_ON, dash_off=DASH_OFF):
+    """Polyligne en pointillés."""
+    residual = 0
+    drawing = True
+
+    for i in range(len(points) - 1):
+        x0, y0 = points[i]
+        x1, y1 = points[i + 1]
+        seg_len = math.hypot(x1 - x0, y1 - y0)
+        if seg_len < 1:
+            continue
+
+        ux, uy = (x1 - x0) / seg_len, (y1 - y0) / seg_len
+        consumed = 0.0
+
+        while consumed < seg_len:
+            dash_len = dash_on if drawing else dash_off
+            step = min(dash_len - residual, seg_len - consumed)
+            if drawing and step > 0:
+                sx = x0 + ux * consumed
+                sy = y0 + uy * consumed
+                ex = x0 + ux * (consumed + step)
+                ey = y0 + uy * (consumed + step)
+                draw.line([(sx, sy), (ex, ey)], fill=color, width=width)
+            consumed += step
+            residual += step
+            if residual >= dash_len:
+                residual = 0
+                drawing = not drawing
+
+
+def render_incidents(incidents, zoom, canvas_w, canvas_h, x0_tile, y0_tile):
+    """Dessine les incidents sur un calque transparent."""
+    origin_px = x0_tile * TILE_SIZE
+    origin_py = y0_tile * TILE_SIZE
+
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+
+    other_lines, closed_lines = [], []
+
+    for inc in incidents:
+        pts = []
+        for coord in inc["coords"]:
+            px, py = lat_lon_to_pixel(coord[1], coord[0], zoom)
+            pts.append((int(px - origin_px), int(py - origin_py)))
+        if len(pts) < 2:
+            continue
+        (closed_lines if inc["closed"] else other_lines).append(pts)
+
+    # Gris en-dessous, rouge par-dessus
+    for pts in other_lines:
+        draw_dashed_line(draw, pts, COLOR_OTHER)
+    for pts in closed_lines:
+        draw_dashed_line(draw, pts, COLOR_CLOSED)
+
+    n = len(closed_lines) + len(other_lines)
+    print(f"    → {n} incidents ({len(closed_lines)} fermetures, {len(other_lines)} autres)")
     return canvas
 
 # =============================================================================
-# CAPTURE D'UNE ZONE
+# ASSEMBLAGE
 # =============================================================================
 
-def capture_zone(name: str, config: dict) -> int:
-    """
-    Capture complète d'une zone : télécharge 3 couches, compose, sauvegarde.
+def build_layer(tiles, x0, y0, x1, y1):
+    cols, rows = x1 - x0 + 1, y1 - y0 + 1
+    canvas = Image.new("RGBA", (cols * TILE_SIZE, rows * TILE_SIZE), (0, 0, 0, 0))
+    for (tx, ty), img in tiles.items():
+        px = (tx - x0) * TILE_SIZE
+        py = (ty - y0) * TILE_SIZE
+        if img.size != (TILE_SIZE, TILE_SIZE):
+            img = img.resize((TILE_SIZE, TILE_SIZE), Image.LANCZOS)
+        canvas.paste(img, (px, py))
+    return canvas
 
-    Pour les zooms fractionnaires (ex: 8.55z), on utilise le zoom entier
-    supérieur (9) pour les tuiles, mais on élargit le viewport pour couvrir
-    la même zone géographique que plan.tomtom.com, puis on redimensionne
-    au format final 1920×1080.
+# =============================================================================
+# CAPTURE
+# =============================================================================
 
-    Returns:
-        Nombre de tuiles utilisées (pour le suivi du budget)
-    """
+def capture_zone(name, config):
     now = datetime.now(TIMEZONE)
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H%M")
@@ -355,190 +339,152 @@ def capture_zone(name: str, config: dict) -> int:
     lat, lon, zoom = config["lat"], config["lon"], config["zoom"]
     zoom_frac = config.get("zoom_frac", float(zoom))
 
-    # Facteur d'expansion pour compenser le zoom entier vs fractionnaire
-    # Appliqué uniquement quand le zoom a été arrondi VERS LE HAUT
-    # (8.55→9 : expand / 12.17→12 : pas d'expand, différence négligeable)
-    if zoom > zoom_frac:
-        scale_factor = 2 ** (zoom - zoom_frac)
-    else:
-        scale_factor = 1.0
-    fetch_width  = round(VIEWPORT_WIDTH * scale_factor)
-    fetch_height = round(VIEWPORT_HEIGHT * scale_factor)
+    scale = 2 ** (zoom - zoom_frac) if zoom > zoom_frac else 1.0
+    fw = round(VIEWPORT_WIDTH * scale)
+    fh = round(VIEWPORT_HEIGHT * scale)
 
-    # Dossier de sortie
     zone_dir = OUTPUT_DIR / date_str / name
     zone_dir.mkdir(parents=True, exist_ok=True)
     filename = zone_dir / f"{date_str}-{time_str}_{name}.jpg"
 
     print(f"\n{'='*60}")
     print(f"[{name}] {now.strftime('%Y-%m-%d %H:%M %Z')}")
-    if scale_factor > 1.01:
-        print(f"[{name}] zoom={zoom_frac}→{zoom}  scale={scale_factor:.2f}x"
-              f"  fetch={fetch_width}×{fetch_height}→{VIEWPORT_WIDTH}×{VIEWPORT_HEIGHT}")
+    if scale > 1.01:
+        print(f"[{name}] zoom={zoom_frac}→{zoom}  scale={scale:.2f}x"
+              f"  fetch={fw}×{fh}→{VIEWPORT_WIDTH}×{VIEWPORT_HEIGHT}")
     else:
         print(f"[{name}] zoom={zoom}  center=({lat:.5f}, {lon:.5f})")
 
-    # Calculer la grille de tuiles (avec viewport élargi)
-    x0, y0, x1, y1, off_x, off_y = get_tile_grid(
-        lat, lon, zoom, fetch_width, fetch_height)
-    tile_coords = [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
-    n_tiles = len(tile_coords)
-    print(f"[{name}] Grille: {x1-x0+1}×{y1-y0+1} = {n_tiles} tuiles/couche"
-          f"  (total: {n_tiles*3} tuiles)")
+    # Grille
+    x0, y0, x1, y1, off_x, off_y = get_tile_grid(lat, lon, zoom, fw, fh)
+    coords = [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
+    n = len(coords)
+    print(f"[{name}] Grille: {x1-x0+1}×{y1-y0+1} = {n} tuiles/couche"
+          f"  ({n*2} tuiles + 1 appel incidents)")
 
-    # --- Télécharger toutes les tuiles en parallèle ---
-    base_tiles = {}
-    flow_tiles = {}
-    incident_tiles = {}
-
-    futures = []  # (layer, tx, ty, future)
-
+    # Tuiles base + flow
+    base_tiles, flow_tiles = {}, {}
+    futures = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        for tx, ty in tile_coords:
-            # Carte de base — cachée pour la journée (ne change pas)
-            base_url = BASE_URL.format(z=zoom, x=tx, y=ty, ts=TILE_SIZE, key=API_KEY)
-            cache_key = f"base/{date_str}/{zoom}/{tx}_{ty}.png"
-            futures.append(("base", tx, ty,
-                            pool.submit(fetch_tile, base_url, cache_key)))
+        for tx, ty in coords:
+            burl = BASE_URL.format(z=zoom, x=tx, y=ty, ts=TILE_SIZE, key=API_KEY)
+            ck = f"base/{date_str}/{zoom}/{tx}_{ty}.png"
+            futures.append(("base", tx, ty, pool.submit(fetch_tile, burl, ck)))
 
-            # Traffic Flow — temps réel, jamais caché
-            flow_url = FLOW_URL.format(z=zoom, x=tx, y=ty, ts=TILE_SIZE, key=API_KEY)
-            futures.append(("flow", tx, ty,
-                            pool.submit(fetch_tile, flow_url, None)))
+            furl = FLOW_URL.format(z=zoom, x=tx, y=ty, ts=TILE_SIZE, key=API_KEY)
+            futures.append(("flow", tx, ty, pool.submit(fetch_tile, furl, None)))
 
-            # Incidents — temps réel, jamais caché
-            inc_url = INCIDENTS_URL.format(z=zoom, x=tx, y=ty, key=API_KEY)
-            futures.append(("incidents", tx, ty,
-                            pool.submit(fetch_tile, inc_url, None)))
-
-        # Collecter les résultats
-        for layer, tx, ty, future in futures:
-            img = future.result()
+        for layer, tx, ty, fut in futures:
+            img = fut.result()
             if layer == "base":
                 base_tiles[(tx, ty)] = img
-            elif layer == "flow":
-                flow_tiles[(tx, ty)] = img
             else:
-                incident_tiles[(tx, ty)] = img
+                flow_tiles[(tx, ty)] = img
 
-    # --- Assembler les couches ---
-    print(f"[{name}] Assemblage des couches...")
-    base_layer     = build_layer(base_tiles,     x0, y0, x1, y1)
-    flow_layer     = build_layer(flow_tiles,     x0, y0, x1, y1)
-    incident_layer = build_layer(incident_tiles, x0, y0, x1, y1)
+    # Incidents
+    bbox = get_viewport_bbox(lat, lon, zoom, fw, fh)
+    print(f"[{name}] Incidents API (bbox={bbox[0]:.3f},{bbox[1]:.3f},{bbox[2]:.3f},{bbox[3]:.3f})...")
+    incidents = fetch_incidents(bbox)
 
-    # Composite : base → flow (transparent) → incidents (transparent)
+    # Assemblage
+    print(f"[{name}] Assemblage...")
+    base_layer = build_layer(base_tiles, x0, y0, x1, y1)
+    flow_layer = build_layer(flow_tiles, x0, y0, x1, y1)
+    inc_layer  = render_incidents(incidents, zoom,
+                                  base_layer.size[0], base_layer.size[1], x0, y0)
+
     composite = Image.alpha_composite(base_layer, flow_layer)
-    composite = Image.alpha_composite(composite, incident_layer)
+    composite = Image.alpha_composite(composite, inc_layer)
 
-    # Découper au viewport élargi
-    cropped = composite.crop((off_x, off_y, off_x + fetch_width, off_y + fetch_height))
+    cropped = composite.crop((off_x, off_y, off_x + fw, off_y + fh))
+    if scale > 1.01:
+        cropped = cropped.resize((VIEWPORT_WIDTH, VIEWPORT_HEIGHT), Image.LANCZOS)
 
-    # Redimensionner au format final (compense le zoom fractionnaire)
-    if scale_factor > 1.01:
-        cropped = cropped.resize(
-            (VIEWPORT_WIDTH, VIEWPORT_HEIGHT), Image.LANCZOS)
-
-    # Sauvegarder en JPEG
     final = cropped.convert("RGB")
     final.save(str(filename), "JPEG", quality=85, optimize=True)
+    print(f"[{name}] ✓ {filename} ({filename.stat().st_size / 1024:.0f} KB)")
 
-    size_kb = filename.stat().st_size / 1024
-    print(f"[{name}] ✓ {filename} ({size_kb:.0f} KB)")
-
-    return n_tiles * 3
-
+    return n * 2
 
 # =============================================================================
 # MAINTENANCE
 # =============================================================================
 
 def rotate_old_days():
-    """Supprime les dossiers de captures plus vieux que RETENTION_DAYS."""
     if not OUTPUT_DIR.exists():
         return
-
     cutoff = datetime.now(TIMEZONE).date() - timedelta(days=RETENTION_DAYS)
-    for day_dir in sorted(OUTPUT_DIR.iterdir()):
-        if not day_dir.is_dir() or day_dir.name.startswith("_"):
+    for d in sorted(OUTPUT_DIR.iterdir()):
+        if not d.is_dir() or d.name.startswith("_"):
             continue
         try:
-            folder_date = datetime.strptime(day_dir.name, "%Y-%m-%d").date()
+            if datetime.strptime(d.name, "%Y-%m-%d").date() < cutoff:
+                shutil.rmtree(d)
+                print(f"[rotation] Supprimé: {d.name}")
         except ValueError:
             continue
-        if folder_date < cutoff:
-            shutil.rmtree(day_dir)
-            print(f"[rotation] Supprimé: {day_dir.name}")
 
 
 def clear_stale_cache():
-    """Réinitialise le cache des tuiles de base chaque jour."""
     marker = CACHE_DIR / ".cache-date"
     today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-
     if marker.exists():
         try:
             if marker.read_text().strip() == today:
-                return  # Cache encore valide
+                return
         except Exception:
             pass
-
-    # Nouveau jour → vider le cache
     if CACHE_DIR.exists():
         shutil.rmtree(CACHE_DIR)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     marker.write_text(today)
-    print("[cache] Cache tuiles de base réinitialisé pour aujourd'hui")
-
+    print("[cache] Cache réinitialisé")
 
 # =============================================================================
-# POINT D'ENTRÉE
+# MAIN
 # =============================================================================
 
 if __name__ == "__main__":
     if not API_KEY:
-        print("✗ Variable TOMTOM_API_KEY non définie !")
-        print("  → Ajouter dans GitHub > Settings > Secrets > TOMTOM_API_KEY")
+        print("✗ TOMTOM_API_KEY non définie !")
         sys.exit(1)
 
-    # Parser toutes les zones (URL → lat/lon/zoom)
     parsed_zones = {}
     print("Zones configurées:")
     for name, value in ZONES.items():
         try:
-            config = parse_zone_config(value)
-            parsed_zones[name] = config
-            z_info = f"zoom={config['zoom']}"
-            if config.get('zoom_frac', config['zoom']) != config['zoom']:
-                z_info = f"zoom={config['zoom_frac']}→{config['zoom']}"
-            print(f"  ✓ {name}: lat={config['lat']:.5f} lon={config['lon']:.5f} {z_info}")
+            cfg = parse_zone_config(value)
+            parsed_zones[name] = cfg
+            zf = cfg.get("zoom_frac", cfg["zoom"])
+            zi = f"zoom={zf}→{cfg['zoom']}" if zf != cfg["zoom"] else f"zoom={cfg['zoom']}"
+            print(f"  ✓ {name}: lat={cfg['lat']:.5f} lon={cfg['lon']:.5f} {zi}")
         except Exception as e:
             print(f"  ✗ {name}: {e}")
 
     if not parsed_zones:
-        print("✗ Aucune zone valide configurée !")
+        print("✗ Aucune zone valide !")
         sys.exit(1)
 
     clear_stale_cache()
 
     total_tiles = 0
     errors = 0
-
-    for zone_name, zone_config in parsed_zones.items():
+    for zn, zc in parsed_zones.items():
         try:
-            total_tiles += capture_zone(zone_name, zone_config)
+            total_tiles += capture_zone(zn, zc)
         except Exception as e:
-            print(f"[{zone_name}] ✗ Erreur: {e}")
+            print(f"[{zn}] ✗ Erreur: {e}")
             errors += 1
 
-    # Résumé
     print(f"\n{'='*60}")
     print(f"Résumé: {len(parsed_zones) - errors}/{len(parsed_zones)} zones OK")
-    print(f"Tuiles: {counter}")
-    print(f"Budget journalier estimé: ~{total_tiles * 144} / 50'000")
+    print(f"{counter}")
     print(f"{'='*60}")
 
     try:
         rotate_old_days()
     except Exception as e:
-        print(f"[rotation] ✗ Erreur: {e}")
+        print(f"[rotation] ✗ {e}")
+
+    if errors == len(parsed_zones):
+        sys.exit(1)
