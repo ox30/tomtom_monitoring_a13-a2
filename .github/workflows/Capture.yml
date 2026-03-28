@@ -1,8 +1,7 @@
-name: TomTom Traffic Capture (API)
+name: TomTom Traffic Capture (Hybrid)
 
 on:
   schedule:
-    # Relance la boucle si elle s'est terminée (sécurité)
     - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
@@ -12,7 +11,6 @@ on:
         default: "10"
         type: string
 
-# Un seul job à la fois
 concurrency:
   group: tomtom-capture
   cancel-in-progress: false
@@ -42,7 +40,18 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install requests Pillow
+        run: |
+          pip install requests Pillow playwright
+          playwright install chromium --with-deps
+
+      - name: Vérifier les fichiers requis
+        run: |
+          if [ ! -f capture.py ]; then
+            echo "✗ capture.py introuvable !"
+            ls -la
+            exit 1
+          fi
+          echo "✓ capture.py trouvé"
 
       - name: Boucle de capture
         env:
@@ -51,8 +60,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # ── Configuration ──────────────────────────────────────
-          MAX_RUNTIME=20700   # 5h 45min (limite GitHub = 6h)
+          MAX_RUNTIME=20700
           INTERVAL=$((INTERVAL_MIN * 60))
           START_TIME=$(date +%s)
           CYCLE=0
@@ -61,22 +69,28 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          cp capture.py /tmp/capture.py
+
           git checkout --orphan captures-work
           git rm -rf --cached . -q 2>/dev/null || true
 
-          # README pour la branche captures
+          cp /tmp/capture.py ./capture.py
+
           cat > README.md << 'EOF'
           # Captures TomTom — Trafic A13 (Grisons)
 
-          Captures automatiques via **API TomTom** (tuiles raster) toutes les ~10 minutes.
+          Captures automatiques **hybrides** (Playwright + API TomTom) toutes les ~10 min.
           Fuseau horaire : **Europe/Zurich** (CET/CEST).
 
           ## Méthode
 
-          Chaque capture superpose 3 couches de tuiles :
-          1. **Carte de base** (Map Display API)
-          2. **Traffic Flow** — vitesse relative sur les segments routiers
-          3. **Traffic Incidents** — bouchons et incidents
+          Chaque capture superpose 3 couches :
+          1. **Carte de base** — Playwright (screenshot vectoriel plan.tomtom.com)
+          2. **Traffic Flow** — API TomTom Raster Flow Tiles
+          3. **Traffic Incidents** — API Incident Details v5 (lignes pointillées)
+
+          La carte de base est capturée 1× par démarrage de workflow (~6h).
+          Les couches trafic sont mises à jour toutes les 10 minutes.
 
           ## Télécharger
 
@@ -85,36 +99,13 @@ jobs:
           | **Une capture** | Naviguer dans les dossiers → clic sur l'image → **Download** |
           | **Tout (ZIP)** | [📦 Télécharger le ZIP](https://github.com/ox30/tomtom_monitoring_a13-a2/archive/refs/heads/captures.zip) |
 
-          ## Structure
-
-          ```
-          captures/
-            2026-03-28/
-              zone_A13_Chur/
-                2026-03-28-0830_zone_A13_Chur.jpg
-                2026-03-28-0840_zone_A13_Chur.jpg
-                ...
-              zone_Chur_Isla-T/
-                ...
-              zone_globale_A2_A13/
-                ...
-            2026-03-29/
-              ...
-          ```
-
           ## Zones capturées
 
           | Zone | Couverture | Zoom |
           |---|---|---|
-          | `zone_globale_A2_A13` | Vue d'ensemble A2–A13 | 9 |
-          | `zone_A13_Chur` | Secteur A13 autour de Chur | 10 |
-          | `zone_Chur_Isla-T` | Détail Chur – Isla/Thusis | 12 |
-
-          ## Budget API
-
-          - ~108 tuiles par capture (3 zones × 3 couches × ~12 tuiles)
-          - ~15'500 tuiles/jour (quota gratuit : 50'000/jour)
-          - Tuiles de base cachées (ne changent pas dans la journée)
+          | `zone_globale_A2_A13` | Vue d'ensemble A2–A13 | 8.55 |
+          | `zone_A13_Chur` | Secteur A13 autour de Chur | 9.75 |
+          | `zone_Chur_Isla-T` | Détail Chur – Isla/Thusis | 12.17 |
 
           ## Rétention
 
@@ -127,14 +118,21 @@ jobs:
           git commit --allow-empty -m "captures init"
 
           echo ""
-          echo "╔════════════════════════════════════════════════════════╗"
-          echo "║  TomTom API Capture — intervalle : ${INTERVAL_MIN} min          ║"
-          echo "║  Budget : ~15'500 tuiles/jour (quota : 50'000)       ║"
-          echo "║  Durée max : ~5h45 — puis relance automatique        ║"
-          echo "╚════════════════════════════════════════════════════════╝"
+          echo "╔════════════════════════════════════════════════════════════╗"
+          echo "║  TomTom Hybrid Capture — intervalle : ${INTERVAL_MIN} min            ║"
+          echo "║  Carte de base : Playwright (1× au démarrage)            ║"
+          echo "║  Flow + Incidents : API (toutes les ${INTERVAL_MIN} min)              ║"
+          echo "╚════════════════════════════════════════════════════════════╝"
           echo ""
 
-          # ── Boucle principale ──────────────────────────────────
+          # ── Capture carte de base (Playwright, 1× par workflow) ─
+          echo "━━━ Capture cartes de base (Playwright) ━━━"
+          python capture.py --base-only || {
+            echo "✗ Échec capture base — abandon"
+            exit 1
+          }
+
+          # ── Boucle principale (flow + incidents via API) ────────
           while true; do
             CYCLE_START=$(date +%s)
             CYCLE=$((CYCLE + 1))
@@ -142,8 +140,7 @@ jobs:
             ELAPSED=$((CYCLE_START - START_TIME))
             if [ "$ELAPSED" -ge "$MAX_RUNTIME" ]; then
               echo ""
-              echo "⏱ Durée max atteinte (${ELAPSED}s) — fin de la boucle"
-              echo "  Le prochain run cron prendra le relais."
+              echo "⏱ Durée max atteinte — fin de la boucle"
               break
             fi
 
@@ -151,16 +148,13 @@ jobs:
             echo ""
             echo "━━━ Cycle #${CYCLE} — $(TZ=Europe/Zurich date '+%H:%M %Z') — ${REMAINING} min restantes ━━━"
 
-            # Exécuter les captures
-            python capture.py || echo "⚠ Erreur capture (cycle continue)"
+            python capture.py --cycle-only || echo "⚠ Erreur capture (cycle continue)"
 
-            # Commit + push (amend = toujours un seul commit)
-            git add captures/ README.md
+            git add captures/ README.md 2>/dev/null || git add README.md
             git commit --amend --allow-empty -m "captures $(date -u '+%Y-%m-%d %H:%M') UTC" -q
             git push --force origin captures-work:captures -q
             echo "✓ Push OK"
 
-            # Temps de sommeil
             CYCLE_END=$(date +%s)
             CYCLE_DURATION=$((CYCLE_END - CYCLE_START))
             SLEEP_TIME=$((INTERVAL - CYCLE_DURATION))
@@ -169,7 +163,7 @@ jobs:
               echo "💤 Prochain cycle dans ${SLEEP_TIME}s (capture: ${CYCLE_DURATION}s)"
               sleep "$SLEEP_TIME"
             else
-              echo "⚠ Cycle a pris ${CYCLE_DURATION}s (> ${INTERVAL}s) — enchaîne immédiatement"
+              echo "⚠ Cycle a pris ${CYCLE_DURATION}s — enchaîne"
             fi
           done
 
