@@ -114,7 +114,10 @@ def parse_tomtom_url(url: str) -> dict:
     lat       = float(m.group(1))
     lon       = float(m.group(2))
     zoom_frac = float(m.group(3))
-    zoom      = round(zoom_frac)
+    # floor() → utilise le niveau de zoom inférieur pour reproduire
+    # la densité de routes de plan.tomtom.com (qui masque les petites
+    # routes via son style vectoriel aux zooms fractionnaires)
+    zoom      = int(math.floor(zoom_frac))
 
     return {"lat": lat, "lon": lon, "zoom": zoom, "zoom_frac": zoom_frac}
 
@@ -339,9 +342,13 @@ def capture_zone(name, config):
     lat, lon, zoom = config["lat"], config["lon"], config["zoom"]
     zoom_frac = config.get("zoom_frac", float(zoom))
 
-    scale = 2 ** (zoom - zoom_frac) if zoom > zoom_frac else 1.0
-    fw = round(VIEWPORT_WIDTH * scale)
-    fh = round(VIEWPORT_HEIGHT * scale)
+    # Avec floor(), zoom ≤ zoom_frac → scale < 1 → viewport plus petit → upscale
+    # Ex: 9.75→9 : scale=0.60 → fetch 1143×643 → upscale à 1920×1080
+    # Cela reproduit la densité de routes de plan.tomtom.com
+    scale = 2 ** (zoom - zoom_frac)  # < 1 quand zoom < zoom_frac
+    fw = max(256, round(VIEWPORT_WIDTH * scale))
+    fh = max(256, round(VIEWPORT_HEIGHT * scale))
+    needs_resize = abs(scale - 1.0) > 0.01
 
     zone_dir = OUTPUT_DIR / date_str / name
     zone_dir.mkdir(parents=True, exist_ok=True)
@@ -349,8 +356,8 @@ def capture_zone(name, config):
 
     print(f"\n{'='*60}")
     print(f"[{name}] {now.strftime('%Y-%m-%d %H:%M %Z')}")
-    if scale > 1.01:
-        print(f"[{name}] zoom={zoom_frac}→{zoom}  scale={scale:.2f}x"
+    if needs_resize:
+        print(f"[{name}] zoom={zoom_frac}→{zoom}  scale={scale:.3f}"
               f"  fetch={fw}×{fh}→{VIEWPORT_WIDTH}×{VIEWPORT_HEIGHT}")
     else:
         print(f"[{name}] zoom={zoom}  center=({lat:.5f}, {lon:.5f})")
@@ -397,7 +404,7 @@ def capture_zone(name, config):
     composite = Image.alpha_composite(composite, inc_layer)
 
     cropped = composite.crop((off_x, off_y, off_x + fw, off_y + fh))
-    if scale > 1.01:
+    if needs_resize:
         cropped = cropped.resize((VIEWPORT_WIDTH, VIEWPORT_HEIGHT), Image.LANCZOS)
 
     final = cropped.convert("RGB")
