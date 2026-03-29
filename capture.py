@@ -377,9 +377,11 @@ INCIDENT_MAGNITUDE_COLORS = {
     4: ((100, 10, 10, 255),  (150, 15, 15, 255)),     # Indefinite — rouge très foncé
 }
 
-# Couleurs des tubes hachurés
-HATCHED_RED_COLORS  = ((190, 30, 30, 255), (255, 255, 255, 255))   # rouge vif + blanc
-HATCHED_GREY_COLORS = ((120, 130, 145, 255), (255, 255, 255, 255)) # gris-bleu acier + blanc
+# Couleurs des tubes hachurés — (outline/squares color, grey fill color)
+# Motif : contour fin coloré, fond gris clair, carrés colorés pleine hauteur
+# Ratio : 1/3 carré coloré + 2/3 rectangle gris
+HATCHED_RED_COLORS  = ((190, 30, 30, 255), (216, 216, 216, 255))   # rouge + gris clair
+HATCHED_GREY_COLORS = ((122, 128, 144, 255), (224, 224, 224, 255)) # gris-bleu + gris très clair
 
 # Épaisseur des incidents par type de route (légèrement plus épais que le flow)
 INCIDENT_WIDTH = {
@@ -722,35 +724,35 @@ def download_incidents(lat, lon, zoom, width, height, api_key):
 
 def _draw_hatched_tube(draw, coords, colors, outline_w, main_w):
     """
-    Dessine un tube hachuré losanges (chaîne de diamants) le long d'une polyligne.
-    Reproduit le motif TomTom plan :
-      - Bordure sombre (outline)
-      - Tube de couleur
-      - Diamants blancs découpés à intervalles réguliers (chaîne)
+    Dessine un tube hachuré TomTom le long d'une polyligne.
+    Motif : contour fin coloré → fond gris clair → carrés colorés pleine hauteur.
+    Les carrés touchent les bords haut et bas du tube.
+    Ratio : 1/3 carré coloré + 2/3 rectangle gris.
 
-    Le résultat ressemble à une corde/chaîne de losanges ◇◇◇◇ le long de la route.
+    colors = (colored_part_rgba, grey_fill_rgba)
     """
-    color, white = colors
+    color, grey_fill = colors
 
     if len(coords) < 2:
         return
 
-    # 1. Bordure sombre (outline)
-    outline_dark = tuple(max(0, c - 60) for c in color[:3]) + (255,)
-    draw.line(coords, fill=outline_dark, width=outline_w, joint="curve")
+    # 1. Contour fin coloré (outline)
+    draw.line(coords, fill=color, width=outline_w, joint="curve")
 
-    # 2. Tube de couleur (remplissage principal)
-    draw.line(coords, fill=color, width=main_w, joint="curve")
+    # 2. Fond gris clair (remplissage du tube)
+    draw.line(coords, fill=grey_fill, width=main_w, joint="curve")
 
-    # 3. Diamants blancs découpés le long du chemin
-    # Taille du diamant proportionnelle à l'épaisseur
-    diamond_size = max(3, main_w * 0.6)
-    spacing = diamond_size * 2.0  # distance entre centres de diamants
+    # 3. Carrés colorés le long du chemin
+    # Taille du carré = main_w (pleine hauteur, aussi large que haut)
+    square_size = max(2, main_w)
+    # Espacement : 1/3 carré + 2/3 vide = le carré occupe 1/3 de chaque unité
+    unit_size = square_size * 3.0  # distance entre le début d'un carré et le suivant
+    half_sq = square_size / 2.0
+    half_w = main_w / 2.0
 
-    # Parcourir le chemin et placer des diamants
-    distance = spacing * 0.5  # commencer décalé pour centrer
+    # Parcourir le chemin et placer des carrés
     seg_idx = 0
-    seg_consumed = 0.0
+    seg_consumed = half_sq  # commencer décalé pour que le premier carré soit entier
 
     while seg_idx < len(coords) - 1:
         x0, y0 = coords[seg_idx]
@@ -763,26 +765,26 @@ def _draw_hatched_tube(draw, coords, colors, outline_w, main_w):
             continue
 
         ux, uy = (x1 - x0) / seg_len, (y1 - y0) / seg_len
-        # Normale (perpendiculaire)
+        # Normale (perpendiculaire au segment)
         nx, ny = -uy, ux
 
         while seg_consumed < seg_len:
-            # Position du centre du diamant
+            # Centre du carré sur le chemin
             cx = x0 + ux * seg_consumed
             cy = y0 + uy * seg_consumed
 
-            s = diamond_size
-            # 4 sommets du losange (carré tourné à 45°)
-            diamond = [
-                (cx + ux * s, cy + uy * s),   # pointe avant
-                (cx + nx * s, cy + ny * s),   # pointe droite
-                (cx - ux * s, cy - uy * s),   # pointe arrière
-                (cx - nx * s, cy - ny * s),   # pointe gauche
+            # 4 coins du carré aligné avec la route
+            # Le carré est aussi large (le long de la route) que haut (perpendiculaire)
+            corners = [
+                (cx - ux * half_sq + nx * half_w, cy - uy * half_sq + ny * half_w),
+                (cx + ux * half_sq + nx * half_w, cy + uy * half_sq + ny * half_w),
+                (cx + ux * half_sq - nx * half_w, cy + uy * half_sq - ny * half_w),
+                (cx - ux * half_sq - nx * half_w, cy - uy * half_sq - ny * half_w),
             ]
-            diamond_int = [(int(round(px)), int(round(py))) for px, py in diamond]
-            draw.polygon(diamond_int, fill=white, outline=white)
+            corners_int = [(int(round(px)), int(round(py))) for px, py in corners]
+            draw.polygon(corners_int, fill=color)
 
-            seg_consumed += spacing
+            seg_consumed += unit_size
 
         seg_consumed -= seg_len
         seg_idx += 1
