@@ -358,21 +358,21 @@ INCIDENT_MAGNITUDE_COLORS = {
 }
 
 # Couleurs des tubes hachurés
-HATCHED_RED_COLORS  = ((160, 20, 15, 255), (255, 255, 255, 255))   # (rouge, blanc)
-HATCHED_GREY_COLORS = ((130, 130, 130, 255), (255, 255, 255, 255)) # (gris, blanc)
+HATCHED_RED_COLORS  = ((190, 30, 30, 255), (255, 255, 255, 255))   # rouge vif + blanc
+HATCHED_GREY_COLORS = ((120, 130, 145, 255), (255, 255, 255, 255)) # gris-bleu acier + blanc
 
-# Épaisseur des incidents par type de route
+# Épaisseur des incidents par type de route (légèrement plus épais que le flow)
 INCIDENT_WIDTH = {
-    "Motorway":           (10, 7),
-    "International road": (9, 6),
-    "Major road":         (8, 5),
-    "Secondary road":     (7, 4),
-    "Connecting road":    (6, 4),
-    "Major local road":   (5, 3),
-    "Local road":         (5, 3),
-    "Minor local road":   (4, 3),
+    "Motorway":           (12, 9),
+    "International road": (11, 8),
+    "Major road":         (10, 7),
+    "Secondary road":     (9, 6),
+    "Connecting road":    (8, 5),
+    "Major local road":   (7, 5),
+    "Local road":         (7, 5),
+    "Minor local road":   (6, 4),
 }
-INCIDENT_DEFAULT_WIDTH = (7, 5)
+INCIDENT_DEFAULT_WIDTH = (9, 6)
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -580,16 +580,6 @@ def download_incidents(lat, lon, zoom, width, height, api_key):
     """
     tiles, origin_px, origin_py = get_tile_grid(lat, lon, zoom, width, height, TILE_SIZE)
 
-    # Même filtrage de routes que le flow (mais appliqué côté code, pas côté API)
-    road_types = ROAD_TYPES_BY_ZOOM.get(zoom, [0, 1, 2, 3])
-    # Mapping road_type string → numéro pour filtrage
-    ROAD_TYPE_NUM = {
-        "Motorway": 0, "International road": 1, "Major road": 2,
-        "Secondary road": 3, "Connecting road": 4, "Major local road": 5,
-        "Local road": 6, "Minor local road": 7, "Non public road": 8,
-        "Parking road": 8,
-    }
-
     inc_img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(inc_img)
 
@@ -618,6 +608,26 @@ def download_incidents(lat, lon, zoom, width, height, api_key):
         n_downloaded += 1
 
         features = parse_mvt_tile_incidents(data)
+        if features and n_downloaded <= 3:
+            # Debug : afficher les premiers tags trouvés
+            sample = features[0]['tags']
+            print(f"    [debug] tuile {tx},{tile_y}: {len(features)} features, "
+                  f"tags exemple: {dict(list(sample.items())[:5])}")
+        elif not features and n_downloaded <= 3:
+            # Debug : afficher les layers trouvés pour diagnostic
+            try:
+                tile_pb = _parse_protobuf(data)
+                layer_names = []
+                for ld in tile_pb.get(3, []):
+                    lp = _parse_protobuf(ld)
+                    n = lp.get(1, [b''])[0]
+                    if isinstance(n, bytes):
+                        n = n.decode('utf-8', errors='ignore')
+                    layer_names.append(n)
+                if layer_names:
+                    print(f"    [debug] tuile {tx},{tile_y}: 0 features, layers={layer_names}")
+            except Exception:
+                pass
 
         for feat in features:
             tags = feat['tags']
@@ -637,11 +647,10 @@ def download_incidents(lat, lon, zoom, width, height, api_key):
             if icon_cat is None:
                 continue
 
-            # Filtrer par type de route (comme le flow)
+            # Pas de filtre road_type pour les incidents —
+            # contrairement au flow, les incidents (fermetures, cols fermés)
+            # sont critiques même sur les petites routes
             road_type = tags.get('road_type', '')
-            road_num = ROAD_TYPE_NUM.get(road_type, 99)
-            if road_num not in road_types:
-                continue
 
             # Quel style pour cette catégorie ?
             style = INCIDENT_STYLE.get(icon_cat)
@@ -704,56 +713,70 @@ def download_incidents(lat, lon, zoom, width, height, api_key):
 
 def _draw_hatched_tube(draw, coords, colors, outline_w, main_w):
     """
-    Dessine un tube hachuré losanges (diamants) le long d'une polyligne.
-    Reproduit le motif TomTom plan : alternance couleur/blanc en losanges.
+    Dessine un tube hachuré losanges (chaîne de diamants) le long d'une polyligne.
+    Reproduit le motif TomTom plan :
+      - Bordure sombre (outline)
+      - Tube de couleur
+      - Diamants blancs découpés à intervalles réguliers (chaîne)
 
-    Technique : on dessine le contour sombre, puis des tirets alternés
-    couleur/blanc en deux rangées décalées pour créer l'effet diamant.
+    Le résultat ressemble à une corde/chaîne de losanges ◇◇◇◇ le long de la route.
     """
     color, white = colors
+
+    if len(coords) < 2:
+        return
 
     # 1. Bordure sombre (outline)
     outline_dark = tuple(max(0, c - 60) for c in color[:3]) + (255,)
     draw.line(coords, fill=outline_dark, width=outline_w, joint="curve")
 
-    # 2. Remplissage avec motif losanges
-    # Calculer la longueur totale et les points interpolés
-    dash_len = max(3, main_w)  # taille du losange ≈ épaisseur de la ligne
-    gap_len = dash_len
+    # 2. Tube de couleur (remplissage principal)
+    draw.line(coords, fill=color, width=main_w, joint="curve")
 
-    # Parcourir le chemin et alterner couleur/blanc
-    residual = 0.0
-    drawing_color = True
+    # 3. Diamants blancs découpés le long du chemin
+    # Taille du diamant proportionnelle à l'épaisseur
+    diamond_size = max(3, main_w * 0.6)
+    spacing = diamond_size * 2.0  # distance entre centres de diamants
 
-    for i in range(len(coords) - 1):
-        x0, y0 = coords[i]
-        x1, y1 = coords[i + 1]
+    # Parcourir le chemin et placer des diamants
+    distance = spacing * 0.5  # commencer décalé pour centrer
+    seg_idx = 0
+    seg_consumed = 0.0
+
+    while seg_idx < len(coords) - 1:
+        x0, y0 = coords[seg_idx]
+        x1, y1 = coords[seg_idx + 1]
         seg_len = math.hypot(x1 - x0, y1 - y0)
-        if seg_len < 1:
+
+        if seg_len < 0.5:
+            seg_idx += 1
+            seg_consumed = 0.0
             continue
 
         ux, uy = (x1 - x0) / seg_len, (y1 - y0) / seg_len
-        consumed = 0.0
+        # Normale (perpendiculaire)
+        nx, ny = -uy, ux
 
-        while consumed < seg_len:
-            current_dash = dash_len if drawing_color else gap_len
-            step = min(current_dash - residual, seg_len - consumed)
+        while seg_consumed < seg_len:
+            # Position du centre du diamant
+            cx = x0 + ux * seg_consumed
+            cy = y0 + uy * seg_consumed
 
-            if step > 0:
-                sx = x0 + ux * consumed
-                sy = y0 + uy * consumed
-                ex = x0 + ux * (consumed + step)
-                ey = y0 + uy * (consumed + step)
+            s = diamond_size
+            # 4 sommets du losange (carré tourné à 45°)
+            diamond = [
+                (cx + ux * s, cy + uy * s),   # pointe avant
+                (cx + nx * s, cy + ny * s),   # pointe droite
+                (cx - ux * s, cy - uy * s),   # pointe arrière
+                (cx - nx * s, cy - ny * s),   # pointe gauche
+            ]
+            diamond_int = [(int(round(px)), int(round(py))) for px, py in diamond]
+            draw.polygon(diamond_int, fill=white, outline=white)
 
-                fill = color if drawing_color else white
-                draw.line([(int(sx), int(sy)), (int(ex), int(ey))],
-                          fill=fill, width=main_w)
+            seg_consumed += spacing
 
-            consumed += step
-            residual += step
-            if residual >= (dash_len if drawing_color else gap_len):
-                residual = 0.0
-                drawing_color = not drawing_color
+        seg_consumed -= seg_len
+        seg_idx += 1
 
 
 def parse_mvt_tile_incidents(data):
@@ -948,6 +971,75 @@ def clear_stale_cache():
             print(f"  🗑 Cache expiré: {f}")
 
 
+# ─── Budget API ───────────────────────────────────────────────────────────────
+
+DAILY_QUOTA = 50_000  # Requêtes gratuites TomTom par jour
+CYCLES_PER_RUN = 36   # 6h / 10 min
+RUNS_PER_DAY = 4      # cron toutes les 6h
+
+
+def _count_tiles_for_zone(lat, lon, zoom):
+    """Compte le nombre de tuiles nécessaires pour couvrir le viewport."""
+    tiles, _, _ = get_tile_grid(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, TILE_SIZE)
+    return len(tiles)
+
+
+def print_budget_report():
+    """
+    Affiche le rapport de consommation API estimée.
+    Appelé au début de chaque run.
+    """
+    print(f"\n{'─'*65}")
+    print("📊 BUDGET API — Estimation de consommation")
+    print(f"{'─'*65}")
+
+    total_per_cycle = 0
+    total_base_per_run = 0
+
+    for name, url in ZONES.items():
+        lat, lon, zoom = parse_zone_url(url)
+        n_tiles = _count_tiles_for_zone(lat, lon, zoom)
+        road_types = ROAD_TYPES_BY_ZOOM.get(zoom, [0, 1, 2, 3])
+
+        flow = n_tiles      # vector flow tiles
+        inc = n_tiles        # vector incident tiles
+        base = 1             # static image (1× par run)
+        per_cycle = flow + inc
+
+        print(f"  {name} (zoom={zoom}, roadTypes={road_types})")
+        print(f"    {n_tiles} tuiles × 2 couches = {per_cycle}/cycle  |  base: {base}/run")
+
+        total_per_cycle += per_cycle
+        total_base_per_run += base
+
+    run_cost = total_per_cycle * CYCLES_PER_RUN + total_base_per_run
+    daily_cost = total_per_cycle * CYCLES_PER_RUN * RUNS_PER_DAY + total_base_per_run * RUNS_PER_DAY
+    pct = daily_cost * 100 / DAILY_QUOTA
+    remaining = DAILY_QUOTA - daily_cost
+
+    # Combien de zones supplémentaires possibles
+    if total_per_cycle > 0:
+        avg_per_zone = total_per_cycle // len(ZONES)
+        extra_zones = remaining // (avg_per_zone * CYCLES_PER_RUN * RUNS_PER_DAY) if avg_per_zone > 0 else 0
+    else:
+        extra_zones = 0
+
+    print(f"\n  {'─'*55}")
+    print(f"  Par cycle:       {total_per_cycle} requêtes ({len(ZONES)} zones)")
+    print(f"  Par run (5h45):  {run_cost} requêtes ({CYCLES_PER_RUN} cycles + {total_base_per_run} bases)")
+    print(f"  Par jour (×{RUNS_PER_DAY}):   {daily_cost} / {DAILY_QUOTA} = {pct:.1f}%")
+    print(f"  Marge:           {remaining} req/jour ≈ {extra_zones} zones supplémentaires")
+    print(f"{'─'*65}")
+
+    if pct > 90:
+        print("  ⚠ ATTENTION : consommation proche du quota !")
+    elif pct > 70:
+        print("  ⚠ Consommation élevée — prudence avant d'ajouter des zones")
+    else:
+        print("  ✓ Budget confortable")
+    print()
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -973,6 +1065,9 @@ if __name__ == "__main__":
         lat, lon, zoom = parse_zone_url(url)
         road_types = ROAD_TYPES_BY_ZOOM.get(zoom, [0, 1, 2, 3])
         print(f"  ✓ {name}: lat={lat} lon={lon} zoom={zoom} roadTypes={road_types}")
+
+    # Rapport de budget au début de chaque exécution
+    print_budget_report()
 
     clear_stale_cache()
 
