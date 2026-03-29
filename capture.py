@@ -257,16 +257,16 @@ ROAD_TYPES_BY_ZOOM = {
 # Épaisseur des lignes par type de route (outline, main)
 # Reproduit la hiérarchie visuelle de plan.tomtom.com
 LINE_WIDTH = {
-    "Motorway":         (6, 5),
-    "International road": (5, 4),
-    "Major road":       (4, 4),
-    "Secondary road":   (4, 3),
-    "Connecting road":  (3, 3),
-    "Major local road": (3, 2),
-    "Local road":       (2, 2),
-    "Minor local road": (2, 1),
-    "Non public road":  (1, 1),
-    "Parking road":     (1, 1),
+    "Motorway":         (5, 4),
+    "International road": (4, 4),
+    "Major road":       (4, 3),
+    "Secondary road":   (3, 3),
+    "Connecting road":  (3, 2),
+    "Major local road": (2, 2),
+    "Local road":       (2, 1),
+    "Minor local road": (1, 1),
+    "Non public road":  (0, 1),
+    "Parking road":     (0, 1),
 }
 DEFAULT_WIDTH = (4, 3)
 
@@ -332,20 +332,20 @@ def get_traffic_category(tags):
 #   14 = Broken Down Vehicle (véhicule en panne)
 
 INCIDENT_STYLE = {
-    0:  "solid",          # Unknown
-    1:  "solid",          # Accident
+    0:  "hatched_grey",   # Unknown
+    1:  "hatched_grey",   # Accident
     2:  "hatched_grey",   # Fog
     3:  "hatched_grey",   # Dangerous Conditions
     4:  "hatched_grey",   # Rain
     5:  "hatched_grey",   # Ice
     6:  "solid",          # Jam
-    7:  "solid",          # Lane Closed
+    7:  "hatched_grey",   # Lane Closed
     8:  "hatched_red",    # Road Closed
     9:  "hatched_grey",   # Road Works
     10: "hatched_grey",   # Wind
     11: "hatched_grey",   # Flooding
-    13: "solid",          # Cluster
-    14: "solid",          # Broken Down Vehicle
+    13: "hatched_grey",   # Cluster
+    14: "hatched_grey",   # Broken Down Vehicle
 }
 
 # Priorité de dessin — plus le chiffre est élevé, plus c'est dessiné par-dessus.
@@ -383,16 +383,16 @@ HATCHED_GREY_COLORS = ((120, 130, 145, 255), (255, 255, 255, 255)) # gris-bleu a
 
 # Épaisseur des incidents par type de route (légèrement plus épais que le flow)
 INCIDENT_WIDTH = {
-    "Motorway":           (12, 9),
-    "International road": (11, 8),
-    "Major road":         (10, 7),
-    "Secondary road":     (9, 6),
-    "Connecting road":    (8, 5),
-    "Major local road":   (7, 5),
-    "Local road":         (7, 5),
-    "Minor local road":   (6, 4),
+    "Motorway":           (6, 5),
+    "International road": (5, 5),
+    "Major road":         (5, 4),
+    "Secondary road":     (4, 4),
+    "Connecting road":    (4, 3),
+    "Major local road":   (3, 3),
+    "Local road":         (3, 2),
+    "Minor local road":   (2, 2),
 }
-INCIDENT_DEFAULT_WIDTH = (9, 6)
+INCIDENT_DEFAULT_WIDTH = (5, 4)
 
 # Activation des incidents — peut être désactivé via env INCIDENTS_ENABLED=false
 INCIDENTS_ENABLED = os.environ.get("INCIDENTS_ENABLED", "true").lower() != "false"
