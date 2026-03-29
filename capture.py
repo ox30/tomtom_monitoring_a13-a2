@@ -257,16 +257,16 @@ ROAD_TYPES_BY_ZOOM = {
 # Épaisseur des lignes par type de route (outline, main)
 # Reproduit la hiérarchie visuelle de plan.tomtom.com
 LINE_WIDTH = {
-    "Motorway":         (8, 5),
-    "International road": (7, 4),
-    "Major road":       (6, 4),
-    "Secondary road":   (5, 3),
-    "Connecting road":  (4, 3),
-    "Major local road": (4, 2),
-    "Local road":       (3, 2),
-    "Minor local road": (3, 2),
-    "Non public road":  (2, 1),
-    "Parking road":     (2, 1),
+    "Motorway":         (6, 5),
+    "International road": (5, 4),
+    "Major road":       (4, 4),
+    "Secondary road":   (4, 3),
+    "Connecting road":  (3, 3),
+    "Major local road": (3, 2),
+    "Local road":       (2, 2),
+    "Minor local road": (2, 1),
+    "Non public road":  (1, 1),
+    "Parking road":     (1, 1),
 }
 DEFAULT_WIDTH = (4, 3)
 
