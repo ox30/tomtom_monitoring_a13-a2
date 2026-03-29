@@ -270,8 +270,8 @@ LINE_WIDTH = {
 }
 DEFAULT_WIDTH = (4, 3)
 
-# ─── Charte visuelle TomTom relative0 ────────────────────────────────────────
-# Couleurs exactes extraites de la documentation officielle TomTom
+# ─── Charte visuelle TomTom relative0 adaptée────────────────────────────────────────
+# Couleurs adapté extraites de la documentation officielle TomTom
 # https://developer.tomtom.com/traffic-api/documentation/traffic-flow/raster-flow-tiles
 
 # (outline_color, main_color) — RGBA
