@@ -305,8 +305,9 @@ def get_traffic_category(tags):
 
 
 # ─── Charte incidents TomTom plan ─────────────────────────────────────────────
-# Chaque icon_category est affectée à un style visuel.
-# Modifiez ce dictionnaire pour changer l'apparence d'une catégorie.
+# Chaque icon_category est affectée à un style visuel et une priorité de dessin.
+# Priorité : plus le chiffre est élevé, plus l'élément est dessiné PAR-DESSUS.
+# Modifiez ces dictionnaires pour ajuster l'apparence.
 #
 # Styles disponibles :
 #   "hatched_red"  → Tube losanges rouge/blanc (fermetures)
@@ -347,6 +348,25 @@ INCIDENT_STYLE = {
     14: "solid",          # Broken Down Vehicle
 }
 
+# Priorité de dessin — plus le chiffre est élevé, plus c'est dessiné par-dessus.
+# Ajustez pour changer l'ordre de superposition.
+INCIDENT_PRIORITY = {
+    0:  10,     # Unknown
+    1:  50,     # Accident
+    2:  20,     # Fog
+    3:  20,     # Dangerous Conditions
+    4:  20,     # Rain
+    5:  25,     # Ice
+    6:  60,     # Jam — par-dessus les hachurés
+    7:  55,     # Lane Closed
+    8:  100,    # Road Closed — priorité maximale
+    9:  30,     # Road Works
+    10: 20,     # Wind
+    11: 25,     # Flooding
+    13: 40,     # Cluster
+    14: 45,     # Broken Down Vehicle
+}
+
 # Couleurs des tubes pleins (solid) par magnitude
 # magnitude: (outline_color, main_color) — RGBA
 INCIDENT_MAGNITUDE_COLORS = {
@@ -373,6 +393,9 @@ INCIDENT_WIDTH = {
     "Minor local road":   (6, 4),
 }
 INCIDENT_DEFAULT_WIDTH = (9, 6)
+
+# Activation des incidents — peut être désactivé via env INCIDENTS_ENABLED=false
+INCIDENTS_ENABLED = os.environ.get("INCIDENTS_ENABLED", "true").lower() != "false"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -573,10 +596,12 @@ def download_vector_flow(lat, lon, zoom, width, height, api_key):
 def download_incidents(lat, lon, zoom, width, height, api_key):
     """
     Télécharge les incidents via Vector Incident Tiles (.pbf),
-    parse les features et les dessine selon la charte TomTom plan :
+    trie par priorité (INCIDENT_PRIORITY), puis dessine :
       - hatched_red  : tube losanges rouge/blanc (fermetures)
       - hatched_grey : tube losanges gris/blanc (travaux, météo)
       - solid        : tube plein couleur par magnitude (bouchons)
+
+    Ordre de dessin : priorité basse d'abord, haute par-dessus.
     """
     tiles, origin_px, origin_py = get_tile_grid(lat, lon, zoom, width, height, TILE_SIZE)
 
@@ -585,9 +610,9 @@ def download_incidents(lat, lon, zoom, width, height, api_key):
 
     n_tiles = len(tiles)
     n_downloaded = 0
-    n_hatched_red = 0
-    n_hatched_grey = 0
-    n_solid = 0
+
+    # Phase 1 : Collecter tous les incidents
+    all_incidents = []  # [(priority, style, icon_cat, magnitude, outline_w, main_w, coords)]
 
     for tile_x, tile_y, px_off, py_off in tiles:
         max_tile = 2 ** zoom - 1
@@ -608,26 +633,6 @@ def download_incidents(lat, lon, zoom, width, height, api_key):
         n_downloaded += 1
 
         features = parse_mvt_tile_incidents(data)
-        if features and n_downloaded <= 3:
-            # Debug : afficher les premiers tags trouvés
-            sample = features[0]['tags']
-            print(f"    [debug] tuile {tx},{tile_y}: {len(features)} features, "
-                  f"tags exemple: {dict(list(sample.items())[:5])}")
-        elif not features and n_downloaded <= 3:
-            # Debug : afficher les layers trouvés pour diagnostic
-            try:
-                tile_pb = _parse_protobuf(data)
-                layer_names = []
-                for ld in tile_pb.get(3, []):
-                    lp = _parse_protobuf(ld)
-                    n = lp.get(1, [b''])[0]
-                    if isinstance(n, bytes):
-                        n = n.decode('utf-8', errors='ignore')
-                    layer_names.append(n)
-                if layer_names:
-                    print(f"    [debug] tuile {tx},{tile_y}: 0 features, layers={layer_names}")
-            except Exception:
-                pass
 
         for feat in features:
             tags = feat['tags']
@@ -647,20 +652,14 @@ def download_incidents(lat, lon, zoom, width, height, api_key):
             if icon_cat is None:
                 continue
 
-            # Pas de filtre road_type pour les incidents —
-            # contrairement au flow, les incidents (fermetures, cols fermés)
-            # sont critiques même sur les petites routes
-            road_type = tags.get('road_type', '')
-
-            # Quel style pour cette catégorie ?
             style = INCIDENT_STYLE.get(icon_cat)
             if style is None:
                 continue
 
-            # Épaisseur selon le type de route (road_type déjà récupéré ci-dessus)
+            priority = INCIDENT_PRIORITY.get(icon_cat, 0)
+            road_type = tags.get('road_type', '')
             outline_w, main_w = INCIDENT_WIDTH.get(road_type, INCIDENT_DEFAULT_WIDTH)
 
-            # Magnitude (pour le style solid)
             magnitude = 0
             if 'magnitude' in tags:
                 try:
@@ -672,14 +671,12 @@ def download_incidents(lat, lon, zoom, width, height, api_key):
                 if len(line) < 2:
                     continue
 
-                # Convertir coords tuile en pixels viewport
                 pixel_line = []
                 for tx_coord, ty_coord in line:
                     px = px_off + (tx_coord / extent) * TILE_SIZE
                     py = py_off + (ty_coord / extent) * TILE_SIZE
                     pixel_line.append((px, py))
 
-                # Ignorer les segments hors viewport
                 margin = 50
                 if all(x < -margin or x > width + margin or
                        y < -margin or y > height + margin
@@ -690,19 +687,31 @@ def download_incidents(lat, lon, zoom, width, height, api_key):
                 if len(coords) < 2:
                     continue
 
-                if style == "hatched_red":
-                    _draw_hatched_tube(draw, coords, HATCHED_RED_COLORS, outline_w, main_w)
-                    n_hatched_red += 1
-                elif style == "hatched_grey":
-                    _draw_hatched_tube(draw, coords, HATCHED_GREY_COLORS, outline_w, main_w)
-                    n_hatched_grey += 1
-                elif style == "solid":
-                    colors = INCIDENT_MAGNITUDE_COLORS.get(magnitude,
-                             INCIDENT_MAGNITUDE_COLORS[0])
-                    outline_c, main_c = colors
-                    draw.line(coords, fill=outline_c, width=outline_w, joint="curve")
-                    draw.line(coords, fill=main_c, width=main_w, joint="curve")
-                    n_solid += 1
+                all_incidents.append((priority, style, icon_cat, magnitude,
+                                      outline_w, main_w, coords))
+
+    # Phase 2 : Trier par priorité (basse d'abord → haute dessinée par-dessus)
+    all_incidents.sort(key=lambda x: x[0])
+
+    # Phase 3 : Dessiner dans l'ordre
+    n_hatched_red = 0
+    n_hatched_grey = 0
+    n_solid = 0
+
+    for priority, style, icon_cat, magnitude, outline_w, main_w, coords in all_incidents:
+        if style == "hatched_red":
+            _draw_hatched_tube(draw, coords, HATCHED_RED_COLORS, outline_w, main_w)
+            n_hatched_red += 1
+        elif style == "hatched_grey":
+            _draw_hatched_tube(draw, coords, HATCHED_GREY_COLORS, outline_w, main_w)
+            n_hatched_grey += 1
+        elif style == "solid":
+            colors = INCIDENT_MAGNITUDE_COLORS.get(magnitude,
+                     INCIDENT_MAGNITUDE_COLORS[0])
+            outline_c, main_c = colors
+            draw.line(coords, fill=outline_c, width=outline_w, joint="curve")
+            draw.line(coords, fill=main_c, width=main_w, joint="curve")
+            n_solid += 1
 
     total = n_hatched_red + n_hatched_grey + n_solid
     print(f"  ⚠ Incidents: {total} dessinés "
@@ -883,8 +892,12 @@ def capture_zone(zone_name, zone_url, api_key, now):
     # 2. Traffic Flow (vector tiles)
     flow_img = download_vector_flow(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, api_key)
 
-    # 3. Incidents (vector tiles)
-    inc_img = download_incidents(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, api_key)
+    # 3. Incidents (vector tiles) — désactivable via INCIDENTS_ENABLED=false
+    if INCIDENTS_ENABLED:
+        inc_img = download_incidents(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, api_key)
+    else:
+        inc_img = Image.new("RGBA", (VIEWPORT_WIDTH, VIEWPORT_HEIGHT), (0, 0, 0, 0))
+        print(f"  ⚠ Incidents désactivés (INCIDENTS_ENABLED=false)")
 
     # 4. Composer l'image finale
     composite = base_img.copy()
