@@ -453,6 +453,60 @@ def get_tile_grid(lat, lon, zoom, width, height, tile_size):
     return tiles, origin_px, origin_py
 
 
+# ─── Décalage directionnel (tube côté droit) ─────────────────────────────────
+
+def _offset_polyline(coords, offset_px):
+    """
+    Décale une polyligne vers la DROITE du sens de circulation.
+    En screen coords (Y vers le bas), le perpendiculaire droit = (-uy, ux).
+
+    offset_px > 0 → décale à droite du sens de marche
+    offset_px < 0 → décale à gauche
+
+    Retourne une nouvelle liste de coordonnées décalées.
+    """
+    if len(coords) < 2 or abs(offset_px) < 0.5:
+        return coords
+
+    result = []
+    n = len(coords)
+
+    for i in range(n):
+        # Calculer la direction moyenne au point i
+        if i == 0:
+            # Premier point : direction du premier segment
+            dx = coords[1][0] - coords[0][0]
+            dy = coords[1][1] - coords[0][1]
+        elif i == n - 1:
+            # Dernier point : direction du dernier segment
+            dx = coords[n-1][0] - coords[n-2][0]
+            dy = coords[n-1][1] - coords[n-2][1]
+        else:
+            # Point intermédiaire : moyenne des deux segments adjacents
+            dx = coords[i+1][0] - coords[i-1][0]
+            dy = coords[i+1][1] - coords[i-1][1]
+
+        length = math.hypot(dx, dy)
+        if length < 0.01:
+            result.append(coords[i])
+            continue
+
+        # Normaliser
+        ux = dx / length
+        uy = dy / length
+
+        # Perpendiculaire droite en screen coords (Y vers le bas)
+        nx = -uy
+        ny = ux
+
+        # Décaler le point
+        new_x = coords[i][0] + nx * offset_px
+        new_y = coords[i][1] + ny * offset_px
+        result.append((int(round(new_x)), int(round(new_y))))
+
+    return result
+
+
 # ─── API calls ────────────────────────────────────────────────────────────────
 
 counter = 0  # Compteur de requêtes API
@@ -581,14 +635,23 @@ def download_vector_flow(lat, lon, zoom, width, height, api_key):
 
                 n_features += 1
 
-                # Dessiner : contour d'abord, puis trait principal
+                # Coordonnées pixel
                 coords = [(int(round(x)), int(round(y))) for x, y in pixel_line]
 
                 if len(coords) >= 2:
-                    # Outline (plus large, couleur sombre)
-                    draw.line(coords, fill=outline_color, width=outline_w, joint="curve")
-                    # Main line (plus fine, couleur vive)
-                    draw.line(coords, fill=main_color, width=main_w, joint="curve")
+                    # Décaler le tube vers la droite du sens de circulation
+                    # Le tube visible est sur le bord droit, le côté gauche reste transparent
+                    offset_px = max(1, outline_w * 0.5)
+                    shifted = _offset_polyline(coords, offset_px)
+
+                    # Largeurs visibles (environ moitié de l'original)
+                    vis_outline = max(1, int(math.ceil(outline_w * 0.55)))
+                    vis_main = max(1, int(math.ceil(main_w * 0.5)))
+
+                    # Outline (bordure sombre)
+                    draw.line(shifted, fill=outline_color, width=vis_outline, joint="curve")
+                    # Main (couleur vive)
+                    draw.line(shifted, fill=main_color, width=vis_main, joint="curve")
 
     print(f"  🚗 Flow: {n_downloaded}/{n_tiles} tuiles, {n_features} segments"
           f" (roadTypes={road_types})")
@@ -695,24 +758,33 @@ def download_incidents(lat, lon, zoom, width, height, api_key):
     # Phase 2 : Trier par priorité (basse d'abord → haute dessinée par-dessus)
     all_incidents.sort(key=lambda x: x[0])
 
-    # Phase 3 : Dessiner dans l'ordre
+    # Phase 3 : Dessiner dans l'ordre, décalé à droite du sens de circulation
+    # Les incidents sont légèrement moins décalés que le flow → ils "dépassent"
     n_hatched_red = 0
     n_hatched_grey = 0
     n_solid = 0
 
     for priority, style, icon_cat, magnitude, outline_w, main_w, coords in all_incidents:
+        # Décalage directionnel (moins que le flow → dépasse légèrement)
+        offset_px = max(1, outline_w * 0.35)
+        shifted = _offset_polyline(coords, offset_px)
+
+        # Largeurs visibles (un peu plus larges que le flow pour ressortir)
+        vis_outline = max(1, int(math.ceil(outline_w * 0.65)))
+        vis_main = max(1, int(math.ceil(main_w * 0.6)))
+
         if style == "hatched_red":
-            _draw_hatched_tube(draw, coords, HATCHED_RED_COLORS, outline_w, main_w)
+            _draw_hatched_tube(draw, shifted, HATCHED_RED_COLORS, vis_outline, vis_main)
             n_hatched_red += 1
         elif style == "hatched_grey":
-            _draw_hatched_tube(draw, coords, HATCHED_GREY_COLORS, outline_w, main_w)
+            _draw_hatched_tube(draw, shifted, HATCHED_GREY_COLORS, vis_outline, vis_main)
             n_hatched_grey += 1
         elif style == "solid":
             colors = INCIDENT_MAGNITUDE_COLORS.get(magnitude,
                      INCIDENT_MAGNITUDE_COLORS[0])
             outline_c, main_c = colors
-            draw.line(coords, fill=outline_c, width=outline_w, joint="curve")
-            draw.line(coords, fill=main_c, width=main_w, joint="curve")
+            draw.line(shifted, fill=outline_c, width=vis_outline, joint="curve")
+            draw.line(shifted, fill=main_c, width=vis_main, joint="curve")
             n_solid += 1
 
     total = n_hatched_red + n_hatched_grey + n_solid
