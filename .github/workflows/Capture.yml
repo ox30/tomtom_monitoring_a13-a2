@@ -1,32 +1,43 @@
 name: TomTom Traffic Capture (Vector Flow)
 
 on:
+  schedule:
+    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       interval:
-        description: 'Intervalle entre les captures (secondes)'
+        description: "Intervalle entre captures (secondes)"
         required: false
-        default: '600'
+        default: "600"
       cycles:
-        description: 'Nombre de cycles'
+        description: "Nombre de cycles (défaut: boucle jusqu'à 5h45)"
         required: false
-        default: '36'
-  schedule:
-    - cron: '0 0,6,12,18 * * *'
+        default: "0"
 
-permissions:
-  contents: write
+# Un seul job à la fois
+concurrency:
+  group: tomtom-capture
+  cancel-in-progress: false
 
 jobs:
-  capture:
+  capture-loop:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     timeout-minutes: 370
 
     steps:
-      - name: Checkout main
+      - name: Checkout code (main)
         uses: actions/checkout@v4
         with:
-          ref: main
+          fetch-depth: 1
+
+      - name: Restaurer les captures existantes
+        run: |
+          git fetch origin captures --depth=1 2>/dev/null && \
+          git checkout origin/captures -- captures/ 2>/dev/null && \
+          echo "✓ Captures précédentes restaurées" || \
+          echo "→ Première exécution — pas de captures précédentes"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -36,56 +47,133 @@ jobs:
       - name: Install dependencies
         run: pip install requests Pillow
 
-      - name: Vérifier les fichiers requis
-        run: |
-          if [ ! -f capture.py ]; then
-            echo "✗ capture.py introuvable dans le repo !"
-            exit 1
-          fi
-
-      - name: Préparer branche captures
-        run: |
-          cp capture.py /tmp/capture.py
-          cp requirements.txt /tmp/requirements.txt 2>/dev/null || true
-
-          git fetch origin captures || true
-          if git rev-parse --verify origin/captures >/dev/null 2>&1; then
-            git checkout captures
-          else
-            git checkout -b captures
-          fi
-
-          cp /tmp/capture.py capture.py
-          cp /tmp/requirements.txt requirements.txt 2>/dev/null || true
-          echo "✓ capture.py présent sur la branche captures"
-
       - name: Boucle de capture
         env:
           TOMTOM_API_KEY: ${{ secrets.TOMTOM_API_KEY }}
+          INTERVAL_SEC: ${{ github.event.inputs.interval || '600' }}
+          MAX_CYCLES: ${{ github.event.inputs.cycles || '0' }}
         run: |
-          INTERVAL=${{ github.event.inputs.interval || '600' }}
-          CYCLES=${{ github.event.inputs.cycles || '36' }}
+          set -euo pipefail
 
-          echo "═══ Démarrage: ${CYCLES} cycles, intervalle ${INTERVAL}s ═══"
+          # ── Configuration ──────────────────────────────────────
+          MAX_RUNTIME=20700   # 5h 45min (limite GH = 6h)
+          INTERVAL=${INTERVAL_SEC}
+          START_TIME=$(date +%s)
+          CYCLE=0
 
-          for CYCLE in $(seq 1 $CYCLES); do
+          # ── Préparation git (branche orpheline pour push) ──────
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout --orphan captures-work
+          git rm -rf --cached . -q 2>/dev/null || true
+
+          # Générer le README pour la branche captures
+          cat > README.md << 'EOF'
+          # Captures TomTom — Trafic A13/A2
+
+          Captures automatiques de la carte TomTom (flow vectoriel + incidents) toutes les ~10 minutes.
+          Fuseau horaire : **Europe/Zurich** (CET/CEST).
+
+          ## Télécharger
+
+          | Quoi | Comment |
+          |---|---|
+          | **Une capture** | Naviguer dans les dossiers ci-dessous → clic sur l'image → bouton ↓ **Download** |
+          | **Tout télécharger (ZIP)** | [📦 Télécharger le ZIP de toutes les captures](https://github.com/ox30/tomtom_monitoring_a13-a2/archive/refs/heads/captures.zip) |
+
+          ## Structure
+
+          ```
+          captures/
+            2026-03-29/                                          ← un dossier par jour
+              zone_A13_Chur/
+                2026-03-29-0830_zone_A13_Chur.jpg                ← heure locale Zurich
+                2026-03-29-0840_zone_A13_Chur.jpg
+                ...
+              zone_Chur_Isla-T/
+                ...
+              zone_globale_A2_A13/
+                ...
+              _base/
+                2026-03-29-0830_zone_A13_Chur_base.jpg           ← carte de base (sans trafic)
+                ...
+            2026-03-30/
+              ...
+          ```
+
+          ## Zones capturées
+
+          | Zone | Couverture |
+          |---|---|
+          | `zone_globale_A2_A13` | Vue d'ensemble A2–A13 |
+          | `zone_A13_Chur` | Secteur A13 autour de Chur |
+          | `zone_Chur_Isla-T` | Détail Chur – Isla/Thusis |
+
+          ## Rétention
+
+          Les captures de plus de **7 jours** sont automatiquement supprimées.
+          EOF
+
+          # Nettoyer l'indentation du heredoc
+          sed -i 's/^          //' README.md
+
+          git add captures/ README.md 2>/dev/null || true
+          git commit --allow-empty -m "captures init"
+
+          echo ""
+          echo "╔════════════════════════════════════════════════════╗"
+          echo "║  Boucle de capture — intervalle : ${INTERVAL}s    ║"
+          echo "║  Durée max : ~5h45 — puis relance automatique     ║"
+          echo "╚════════════════════════════════════════════════════╝"
+          echo ""
+
+          # ── Boucle principale ──────────────────────────────────
+          while true; do
+            CYCLE_START=$(date +%s)
+            CYCLE=$((CYCLE + 1))
+
+            # Vérifier nombre max de cycles (0 = illimité/auto)
+            if [ "$MAX_CYCLES" -gt 0 ] && [ "$CYCLE" -gt "$MAX_CYCLES" ]; then
+              echo ""
+              echo "✓ ${MAX_CYCLES} cycles atteints — fin."
+              break
+            fi
+
+            # Vérifier durée max
+            ELAPSED=$((CYCLE_START - START_TIME))
+            if [ "$ELAPSED" -ge "$MAX_RUNTIME" ]; then
+              echo ""
+              echo "⏱ Durée max atteinte (${ELAPSED}s) — fin de la boucle"
+              echo "  Le prochain run cron prendra le relais."
+              break
+            fi
+
+            REMAINING=$(( (MAX_RUNTIME - ELAPSED) / 60 ))
             echo ""
-            echo "──── Cycle ${CYCLE}/${CYCLES} — $(date -u '+%H:%M UTC') ────"
-            
-            python capture.py || echo "⚠ Erreur cycle ${CYCLE}"
+            echo "━━━ Cycle #${CYCLE} — $(TZ=Europe/Zurich date '+%H:%M %Z') — ${REMAINING} min restantes ━━━"
 
-            git add -A captures/ .base-cache/ capture.py
-            TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git commit -m "📸 ${TIMESTAMP}" --allow-empty || true
-            git push origin captures || true
+            # Exécuter les captures
+            python capture.py || echo "⚠ Erreur capture (cycle continue)"
 
-            if [ "$CYCLE" -lt "$CYCLES" ]; then
-              echo "⏳ Prochain cycle dans ${INTERVAL}s..."
-              sleep $INTERVAL
+            # Commit + push (amend = toujours un seul commit)
+            git add captures/ .base-cache/ README.md
+            git commit --amend --allow-empty -m "captures $(TZ=Europe/Zurich date '+%Y-%m-%d %H:%M %Z')" -q
+            git push --force origin captures-work:captures -q
+            echo "✓ Push OK"
+
+            # Calculer le temps de sommeil (smart sleep)
+            CYCLE_END=$(date +%s)
+            CYCLE_DURATION=$((CYCLE_END - CYCLE_START))
+            SLEEP_TIME=$((INTERVAL - CYCLE_DURATION))
+
+            if [ "$SLEEP_TIME" -gt 0 ]; then
+              echo "💤 Prochain cycle dans ${SLEEP_TIME}s (capture a pris ${CYCLE_DURATION}s)"
+              sleep "$SLEEP_TIME"
+            else
+              echo "⚠ Cycle a pris ${CYCLE_DURATION}s (> ${INTERVAL}s) — enchaîne immédiatement"
             fi
           done
 
           echo ""
-          echo "═══ Boucle terminée après ${CYCLES} cycles ═══"
+          echo "═══ Boucle terminée après ${CYCLE} cycles ═══"
