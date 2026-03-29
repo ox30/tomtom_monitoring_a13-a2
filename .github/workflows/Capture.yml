@@ -31,11 +31,11 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Restaurer les captures existantes
+      - name: Restaurer les données existantes
         run: |
           git fetch origin captures --depth=1 2>/dev/null && \
           git checkout origin/captures -- captures/ bases/ 2>/dev/null && \
-          echo "✓ Captures et bases précédentes restaurées" || \
+          echo "✓ Données précédentes restaurées" || \
           echo "→ Première exécution — pas de données précédentes"
 
       - name: Setup Python
@@ -64,6 +64,9 @@ jobs:
 
           git checkout --orphan captures-work
           git rm -rf --cached . -q 2>/dev/null || true
+
+          # Créer les dossiers racine pour éviter les erreurs git add
+          mkdir -p captures bases
 
           # README pour la branche captures
           cat > README.md << 'EOF'
@@ -97,10 +100,7 @@ jobs:
             2026-03-29/
               zone_A13_Chur/
                 2026-03-29-0600_zone_A13_Chur_base.jpg
-              zone_Chur_Isla-T/
-                ...
-              zone_globale_A2_A13/
-                ...
+              ...
           ```
 
           ## Zones capturées
@@ -117,7 +117,7 @@ jobs:
           EOF
           sed -i 's/^          //' README.md
 
-          git add captures/ bases/ README.md 2>/dev/null || true
+          git add -A
           git commit --allow-empty -m "captures init"
 
           # ── Sauvegarder les cartes de base (1× par run) ──────
@@ -127,7 +127,7 @@ jobs:
           echo "╚════════════════════════════════════════════════════╝"
           python capture.py --save-bases || echo "⚠ Erreur sauvegarde bases"
 
-          git add captures/ bases/ README.md
+          git add -A
           git commit --amend --allow-empty -m "captures $(TZ=Europe/Zurich date '+%Y-%m-%d %H:%M %Z')" -q
           git push --force origin captures-work:captures -q
           echo "✓ Bases sauvegardées et pushées"
@@ -162,7 +162,7 @@ jobs:
 
             python capture.py || echo "⚠ Erreur capture (cycle continue)"
 
-            git add captures/ bases/ README.md
+            git add -A
             git commit --amend --allow-empty -m "captures $(TZ=Europe/Zurich date '+%Y-%m-%d %H:%M %Z')" -q
             git push --force origin captures-work:captures -q
             echo "✓ Push OK"
