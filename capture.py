@@ -7,15 +7,19 @@ Architecture (3 couches superposées) :
   1. Carte de base   → API Static Image (une seule requête HTTP, pas de navigateur)
   2. Traffic Flow     → Vector Flow Tiles (.pbf) — filtrage par type de route,
                         rendu Pillow avec la charte visuelle relative0 de plan.tomtom.com
-  3. Incidents        → API Incident Details v5 + dessin Pillow (pointillés)
+  3. Incidents        → Vector Incident Tiles (.pbf) — 3 styles visuels :
+                        • hatched_red  = tube losanges rouge/blanc (fermetures)
+                        • hatched_grey = tube losanges gris/blanc (travaux, météo)
+                        • solid        = tube plein couleur par magnitude (bouchons)
 
-Avantages vs raster flow tiles :
+Avantages vs versions précédentes :
   - Filtrage par catégorie de route (motorway, international, major…)
   - Épaisseur de ligne proportionnelle au type de route
   - Contour sombre autour de chaque segment (comme plan.tomtom.com)
-  - Contrôle total sur les couleurs et le style
+  - Incidents vectoriels avec charte graphique configurable
+  - Plus d'appel à l'API Incident Details v5 (tout via tuiles, quota 50k/jour)
 
-Dépendances : requests, Pillow, mapbox-vector-tile
+Dépendances : requests, Pillow (parseur protobuf intégré)
 """
 
 import os
@@ -298,12 +302,75 @@ def get_traffic_category(tags):
         return "free"
 
 
-# Dessin incidents (inchangé — API v5 + Pillow)
-COLOR_CLOSED = (190, 25, 25, 255)
-COLOR_OTHER  = (110, 110, 110, 255)
-INCIDENT_LINE_WIDTH = 5
-DASH_ON      = 6
-DASH_OFF     = 5
+# ─── Charte incidents TomTom plan ─────────────────────────────────────────────
+# Chaque icon_category est affectée à un style visuel.
+# Modifiez ce dictionnaire pour changer l'apparence d'une catégorie.
+#
+# Styles disponibles :
+#   "hatched_red"  → Tube losanges rouge/blanc (fermetures)
+#   "hatched_grey" → Tube losanges gris/blanc (travaux, météo…)
+#   "solid"        → Tube plein, couleur selon magnitude (bouchons…)
+#   None           → Ne pas afficher cette catégorie
+#
+# icon_category :
+#   0  = Unknown
+#   1  = Accident
+#   2  = Fog (brouillard)
+#   3  = Dangerous Conditions
+#   4  = Rain (pluie)
+#   5  = Ice (verglas)
+#   6  = Jam (bouchon)
+#   7  = Lane Closed (voie fermée)
+#   8  = Road Closed (route fermée)
+#   9  = Road Works (travaux)
+#   10 = Wind (vent)
+#   11 = Flooding (inondation)
+#   13 = Cluster (mix)
+#   14 = Broken Down Vehicle (véhicule en panne)
+
+INCIDENT_STYLE = {
+    0:  "solid",          # Unknown
+    1:  "solid",          # Accident
+    2:  "hatched_grey",   # Fog
+    3:  "hatched_grey",   # Dangerous Conditions
+    4:  "hatched_grey",   # Rain
+    5:  "hatched_grey",   # Ice
+    6:  "solid",          # Jam
+    7:  "solid",          # Lane Closed
+    8:  "hatched_red",    # Road Closed
+    9:  "hatched_grey",   # Road Works
+    10: "hatched_grey",   # Wind
+    11: "hatched_grey",   # Flooding
+    13: "solid",          # Cluster
+    14: "solid",          # Broken Down Vehicle
+}
+
+# Couleurs des tubes pleins (solid) par magnitude
+# magnitude: (outline_color, main_color) — RGBA
+INCIDENT_MAGNITUDE_COLORS = {
+    0: ((140, 60, 60, 255),  (200, 100, 100, 255)),   # Unknown — rouge clair
+    1: ((170, 60, 20, 255),  (220, 120, 60, 255)),    # Minor — orange
+    2: ((160, 20, 10, 255),  (210, 50, 30, 255)),     # Moderate — rouge moyen
+    3: ((120, 5, 5, 255),    (170, 10, 10, 255)),     # Major — rouge foncé
+    4: ((100, 10, 10, 255),  (150, 15, 15, 255)),     # Indefinite — rouge très foncé
+}
+
+# Couleurs des tubes hachurés
+HATCHED_RED_COLORS  = ((160, 20, 15, 255), (255, 255, 255, 255))   # (rouge, blanc)
+HATCHED_GREY_COLORS = ((130, 130, 130, 255), (255, 255, 255, 255)) # (gris, blanc)
+
+# Épaisseur des incidents par type de route
+INCIDENT_WIDTH = {
+    "Motorway":           (10, 7),
+    "International road": (9, 6),
+    "Major road":         (8, 5),
+    "Secondary road":     (7, 4),
+    "Connecting road":    (6, 4),
+    "Major local road":   (5, 3),
+    "Local road":         (5, 3),
+    "Minor local road":   (4, 3),
+}
+INCIDENT_DEFAULT_WIDTH = (7, 5)
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -503,108 +570,264 @@ def download_vector_flow(lat, lon, zoom, width, height, api_key):
 
 def download_incidents(lat, lon, zoom, width, height, api_key):
     """
-    Télécharge les incidents via l'API v5 et les dessine en pointillés.
-    Rouge = fermetures, Gris = autres incidents.
+    Télécharge les incidents via Vector Incident Tiles (.pbf),
+    parse les features et les dessine selon la charte TomTom plan :
+      - hatched_red  : tube losanges rouge/blanc (fermetures)
+      - hatched_grey : tube losanges gris/blanc (travaux, météo)
+      - solid        : tube plein couleur par magnitude (bouchons)
     """
-    # Bounding box depuis le viewport
     tiles, origin_px, origin_py = get_tile_grid(lat, lon, zoom, width, height, TILE_SIZE)
 
-    # Calculer la bbox en lat/lon
-    n = 2 ** zoom
-    min_px = origin_px
-    max_px = origin_px + width
-    min_py = origin_py
-    max_py = origin_py + height
-
-    def px_to_lon(px):
-        return (px / TILE_SIZE) / n * 360.0 - 180.0
-
-    def py_to_lat(py):
-        lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * (py / TILE_SIZE) / n)))
-        return math.degrees(lat_rad)
-
-    min_lon = px_to_lon(min_px)
-    max_lon = px_to_lon(max_px)
-    min_lat = py_to_lat(max_py)  # y inversé
-    max_lat = py_to_lat(min_py)
-
-    bbox = f"{min_lat},{min_lon},{max_lat},{max_lon}"
-
-    url = (
-        f"https://api.tomtom.com/traffic/services/5/incidentDetails"
-        f"?key={api_key}"
-        f"&bbox={bbox}"
-        f"&fields={{incidents{{type,geometry{{type,coordinates}},properties{{iconCategory}}}}}}"
-        f"&language=en-US"
-        f"&categoryFilter=0,1,2,3,4,5,6,7,8,9,10,11,13,14"
-    )
-
-    data = api_get(url)
-    if not data or "incidents" not in data:
-        print(f"  ⚠ Pas d'incidents")
-        return Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    # Même filtrage de routes que le flow (mais appliqué côté code, pas côté API)
+    road_types = ROAD_TYPES_BY_ZOOM.get(zoom, [0, 1, 2, 3])
+    # Mapping road_type string → numéro pour filtrage
+    ROAD_TYPE_NUM = {
+        "Motorway": 0, "International road": 1, "Major road": 2,
+        "Secondary road": 3, "Connecting road": 4, "Major local road": 5,
+        "Local road": 6, "Minor local road": 7, "Non public road": 8,
+        "Parking road": 8,
+    }
 
     inc_img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(inc_img)
-    count = 0
 
-    for inc in data.get("incidents", []):
-        geom = inc.get("geometry", {})
-        props = inc.get("properties", {})
-        icon_cat = props.get("iconCategory", -1)
+    n_tiles = len(tiles)
+    n_downloaded = 0
+    n_hatched_red = 0
+    n_hatched_grey = 0
+    n_solid = 0
 
-        coords_raw = geom.get("coordinates", [])
-        if geom.get("type") == "Point":
-            coords_raw = [coords_raw]
-
-        if not coords_raw or not isinstance(coords_raw[0], list):
+    for tile_x, tile_y, px_off, py_off in tiles:
+        max_tile = 2 ** zoom - 1
+        if tile_y < 0 or tile_y > max_tile:
             continue
+        tx = tile_x % (max_tile + 1)
 
-        # Couleur selon le type
-        color = COLOR_CLOSED if icon_cat == 8 else COLOR_OTHER
+        url = (
+            f"https://api.tomtom.com/traffic/map/4/tile/incidents"
+            f"/{zoom}/{tx}/{tile_y}.pbf"
+            f"?key={api_key}"
+            f"&tags=[icon_category,magnitude,road_type,delay]"
+        )
 
-        # Convertir lon/lat en pixels viewport
-        pixel_pts = []
-        for coord in coords_raw:
-            if len(coord) >= 2:
-                clon, clat = coord[0], coord[1]
-                tx, ty = lat_lon_to_tile(clat, clon, zoom)
-                px = tx * TILE_SIZE - origin_px
-                py = ty * TILE_SIZE - origin_py
-                pixel_pts.append((int(round(px)), int(round(py))))
-
-        if len(pixel_pts) < 2:
+        data = api_get(url, binary=True)
+        if not data:
             continue
+        n_downloaded += 1
 
-        # Dessiner en pointillés
-        for i in range(len(pixel_pts) - 1):
-            x0, y0 = pixel_pts[i]
-            x1, y1 = pixel_pts[i + 1]
-            dx, dy = x1 - x0, y1 - y0
-            length = math.hypot(dx, dy)
-            if length < 1:
+        features = parse_mvt_tile_incidents(data)
+
+        for feat in features:
+            tags = feat['tags']
+            extent = feat.get('extent', 4096)
+
+            # Déterminer l'icon_category
+            icon_cat = None
+            for key, val in tags.items():
+                if key == 'icon_category' or key.startswith('icon_category_'):
+                    try:
+                        icon_cat = int(val)
+                    except (ValueError, TypeError):
+                        pass
+                    if icon_cat is not None:
+                        break
+
+            if icon_cat is None:
                 continue
 
-            ux, uy = dx / length, dy / length
-            pos = 0
-            drawing = True
+            # Filtrer par type de route (comme le flow)
+            road_type = tags.get('road_type', '')
+            road_num = ROAD_TYPE_NUM.get(road_type, 99)
+            if road_num not in road_types:
+                continue
 
-            while pos < length:
-                seg = DASH_ON if drawing else DASH_OFF
-                end = min(pos + seg, length)
-                if drawing:
-                    sx = int(round(x0 + ux * pos))
-                    sy = int(round(y0 + uy * pos))
-                    ex = int(round(x0 + ux * end))
-                    ey = int(round(y0 + uy * end))
-                    draw.line([(sx, sy), (ex, ey)], fill=color, width=INCIDENT_LINE_WIDTH)
-                pos = end
-                drawing = not drawing
+            # Quel style pour cette catégorie ?
+            style = INCIDENT_STYLE.get(icon_cat)
+            if style is None:
+                continue
 
-        count += 1
+            # Épaisseur selon le type de route (road_type déjà récupéré ci-dessus)
+            outline_w, main_w = INCIDENT_WIDTH.get(road_type, INCIDENT_DEFAULT_WIDTH)
 
-    print(f"  ⚠ Incidents: {count} dessinés")
+            # Magnitude (pour le style solid)
+            magnitude = 0
+            if 'magnitude' in tags:
+                try:
+                    magnitude = int(tags['magnitude'])
+                except (ValueError, TypeError):
+                    magnitude = 0
+
+            for line in feat['geometry']:
+                if len(line) < 2:
+                    continue
+
+                # Convertir coords tuile en pixels viewport
+                pixel_line = []
+                for tx_coord, ty_coord in line:
+                    px = px_off + (tx_coord / extent) * TILE_SIZE
+                    py = py_off + (ty_coord / extent) * TILE_SIZE
+                    pixel_line.append((px, py))
+
+                # Ignorer les segments hors viewport
+                margin = 50
+                if all(x < -margin or x > width + margin or
+                       y < -margin or y > height + margin
+                       for x, y in pixel_line):
+                    continue
+
+                coords = [(int(round(x)), int(round(y))) for x, y in pixel_line]
+                if len(coords) < 2:
+                    continue
+
+                if style == "hatched_red":
+                    _draw_hatched_tube(draw, coords, HATCHED_RED_COLORS, outline_w, main_w)
+                    n_hatched_red += 1
+                elif style == "hatched_grey":
+                    _draw_hatched_tube(draw, coords, HATCHED_GREY_COLORS, outline_w, main_w)
+                    n_hatched_grey += 1
+                elif style == "solid":
+                    colors = INCIDENT_MAGNITUDE_COLORS.get(magnitude,
+                             INCIDENT_MAGNITUDE_COLORS[0])
+                    outline_c, main_c = colors
+                    draw.line(coords, fill=outline_c, width=outline_w, joint="curve")
+                    draw.line(coords, fill=main_c, width=main_w, joint="curve")
+                    n_solid += 1
+
+    total = n_hatched_red + n_hatched_grey + n_solid
+    print(f"  ⚠ Incidents: {total} dessinés "
+          f"({n_hatched_red} fermé, {n_hatched_grey} travaux/météo, {n_solid} bouchons)"
+          f" — {n_downloaded}/{n_tiles} tuiles")
     return inc_img
+
+
+def _draw_hatched_tube(draw, coords, colors, outline_w, main_w):
+    """
+    Dessine un tube hachuré losanges (diamants) le long d'une polyligne.
+    Reproduit le motif TomTom plan : alternance couleur/blanc en losanges.
+
+    Technique : on dessine le contour sombre, puis des tirets alternés
+    couleur/blanc en deux rangées décalées pour créer l'effet diamant.
+    """
+    color, white = colors
+
+    # 1. Bordure sombre (outline)
+    outline_dark = tuple(max(0, c - 60) for c in color[:3]) + (255,)
+    draw.line(coords, fill=outline_dark, width=outline_w, joint="curve")
+
+    # 2. Remplissage avec motif losanges
+    # Calculer la longueur totale et les points interpolés
+    dash_len = max(3, main_w)  # taille du losange ≈ épaisseur de la ligne
+    gap_len = dash_len
+
+    # Parcourir le chemin et alterner couleur/blanc
+    residual = 0.0
+    drawing_color = True
+
+    for i in range(len(coords) - 1):
+        x0, y0 = coords[i]
+        x1, y1 = coords[i + 1]
+        seg_len = math.hypot(x1 - x0, y1 - y0)
+        if seg_len < 1:
+            continue
+
+        ux, uy = (x1 - x0) / seg_len, (y1 - y0) / seg_len
+        consumed = 0.0
+
+        while consumed < seg_len:
+            current_dash = dash_len if drawing_color else gap_len
+            step = min(current_dash - residual, seg_len - consumed)
+
+            if step > 0:
+                sx = x0 + ux * consumed
+                sy = y0 + uy * consumed
+                ex = x0 + ux * (consumed + step)
+                ey = y0 + uy * (consumed + step)
+
+                fill = color if drawing_color else white
+                draw.line([(int(sx), int(sy)), (int(ex), int(ey))],
+                          fill=fill, width=main_w)
+
+            consumed += step
+            residual += step
+            if residual >= (dash_len if drawing_color else gap_len):
+                residual = 0.0
+                drawing_color = not drawing_color
+
+
+def parse_mvt_tile_incidents(data):
+    """
+    Parse une tuile MVT et retourne les features du layer 'Traffic incidents flow'.
+    Même logique que parse_mvt_tile mais pour le layer incidents.
+    """
+    if not data or len(data) < 2:
+        return []
+
+    tile = _parse_protobuf(data)
+    features_out = []
+
+    for layer_data in tile.get(3, []):
+        layer = _parse_protobuf(layer_data)
+
+        name = layer.get(1, [b''])[0]
+        if isinstance(name, bytes):
+            name = name.decode('utf-8', errors='ignore')
+
+        # On traite "Traffic incidents flow" (lignes) — pas les POI (points)
+        if name != "Traffic incidents flow":
+            continue
+
+        extent = layer.get(5, [4096])[0]
+
+        keys = []
+        for k in layer.get(3, []):
+            keys.append(k.decode('utf-8', errors='ignore') if isinstance(k, bytes) else str(k))
+
+        values = []
+        for v_data in layer.get(4, []):
+            v_fields = _parse_protobuf(v_data)
+            if 1 in v_fields:
+                val = v_fields[1][0]
+                values.append(val.decode('utf-8', errors='ignore') if isinstance(val, bytes) else str(val))
+            elif 2 in v_fields:
+                values.append(v_fields[2][0])
+            elif 3 in v_fields:
+                values.append(v_fields[3][0])
+            elif 4 in v_fields:
+                values.append(v_fields[4][0])
+            elif 5 in v_fields:
+                values.append(v_fields[5][0])
+            elif 6 in v_fields:
+                values.append(_decode_zigzag(v_fields[6][0]))
+            elif 7 in v_fields:
+                values.append(bool(v_fields[7][0]))
+            else:
+                values.append(None)
+
+        for feat_data in layer.get(2, []):
+            feat = _parse_protobuf(feat_data)
+
+            tags_raw = _decode_packed_uint32(feat.get(2, [b''])[0]) if 2 in feat and isinstance(feat[2][0], bytes) else []
+            props = {}
+            for j in range(0, len(tags_raw) - 1, 2):
+                k_idx = tags_raw[j]
+                v_idx = tags_raw[j + 1]
+                if k_idx < len(keys) and v_idx < len(values):
+                    props[keys[k_idx]] = values[v_idx]
+
+            geom_raw = feat.get(4, [b''])[0]
+            if isinstance(geom_raw, bytes) and len(geom_raw) > 0:
+                geometry = _decode_geometry(geom_raw)
+            else:
+                geometry = []
+
+            if geometry:
+                features_out.append({
+                    'geometry': geometry,
+                    'tags': props,
+                    'extent': extent,
+                })
+
+    return features_out
 
 
 # ─── Capture d'une zone ──────────────────────────────────────────────────────
