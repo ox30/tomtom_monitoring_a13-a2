@@ -396,6 +396,22 @@ INCIDENT_WIDTH = {
 }
 INCIDENT_DEFAULT_WIDTH = (5, 4)
 
+# ─── Décalage directionnel (tube côté droit du sens de circulation) ───────────
+# Chaque tube est décalé vers la droite et affiné pour séparer les deux sens.
+# Multiplicateurs appliqués à l'épaisseur d'origine (outline_w / main_w).
+#
+# offset  = distance du centre de la route (plus grand → plus écarté)
+# outline = épaisseur de la bordure visible
+# main    = épaisseur de la couleur visible
+
+FLOW_OFFSET     = 0.5     # Décalage flow (× outline_w)
+FLOW_VIS_OUTLINE = 0.55   # Bordure visible flow (× outline_w)
+FLOW_VIS_MAIN    = 0.5    # Couleur visible flow (× main_w)
+
+INCIDENT_OFFSET      = 0.35   # Décalage incidents (× outline_w) — moins que flow → dépasse
+INCIDENT_VIS_OUTLINE = 0.65   # Bordure visible incidents (× outline_w)
+INCIDENT_VIS_MAIN    = 0.6    # Couleur visible incidents (× main_w)
+
 # Activation des incidents — peut être désactivé via env INCIDENTS_ENABLED=false
 INCIDENTS_ENABLED = os.environ.get("INCIDENTS_ENABLED", "true").lower() != "false"
 
@@ -640,13 +656,12 @@ def download_vector_flow(lat, lon, zoom, width, height, api_key):
 
                 if len(coords) >= 2:
                     # Décaler le tube vers la droite du sens de circulation
-                    # Le tube visible est sur le bord droit, le côté gauche reste transparent
-                    offset_px = max(1, outline_w * 0.5)
+                    offset_px = max(1, outline_w * FLOW_OFFSET)
                     shifted = _offset_polyline(coords, offset_px)
 
-                    # Largeurs visibles (environ moitié de l'original)
-                    vis_outline = max(1, int(math.ceil(outline_w * 0.55)))
-                    vis_main = max(1, int(math.ceil(main_w * 0.5)))
+                    # Largeurs visibles
+                    vis_outline = max(1, int(math.ceil(outline_w * FLOW_VIS_OUTLINE)))
+                    vis_main = max(1, int(math.ceil(main_w * FLOW_VIS_MAIN)))
 
                     # Outline (bordure sombre)
                     draw.line(shifted, fill=outline_color, width=vis_outline, joint="curve")
@@ -765,13 +780,13 @@ def download_incidents(lat, lon, zoom, width, height, api_key):
     n_solid = 0
 
     for priority, style, icon_cat, magnitude, outline_w, main_w, coords in all_incidents:
-        # Décalage directionnel (moins que le flow → dépasse légèrement)
-        offset_px = max(1, outline_w * 0.35)
+        # Décalage directionnel
+        offset_px = max(1, outline_w * INCIDENT_OFFSET)
         shifted = _offset_polyline(coords, offset_px)
 
-        # Largeurs visibles (un peu plus larges que le flow pour ressortir)
-        vis_outline = max(1, int(math.ceil(outline_w * 0.65)))
-        vis_main = max(1, int(math.ceil(main_w * 0.6)))
+        # Largeurs visibles
+        vis_outline = max(1, int(math.ceil(outline_w * INCIDENT_VIS_OUTLINE)))
+        vis_main = max(1, int(math.ceil(main_w * INCIDENT_VIS_MAIN)))
 
         if style == "hatched_red":
             _draw_hatched_tube(draw, shifted, HATCHED_RED_COLORS, vis_outline, vis_main)
