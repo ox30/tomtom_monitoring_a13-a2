@@ -235,8 +235,9 @@ VIEWPORT_WIDTH  = 1920
 VIEWPORT_HEIGHT = 1080
 TILE_SIZE       = 512       # Taille des tuiles vectorielles (en pixels de rendu)
 RETENTION_DAYS  = 7
-OUTPUT_DIR      = Path("captures")
-CACHE_DIR       = Path(".base-cache")
+OUTPUT_DIR      = Path("captures")    # Captures toutes les 10 min
+BASES_DIR       = Path("bases")       # Cartes de base 1× par run
+CACHE_DIR       = Path(".base-cache") # Cache local (pas commité)
 TIMEZONE        = ZoneInfo("Europe/Zurich")
 
 # Filtrage des types de route par niveau de zoom
@@ -841,16 +842,10 @@ def capture_zone(zone_name, zone_url, api_key, now):
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H%M")
 
-    # 1. Carte de base (cachée — ne change pas souvent)
+    # 1. Carte de base (cache local uniquement)
     cache_path = CACHE_DIR / f"{zone_name}_z{zoom}.png"
-    cache_age_ok = False
     if cache_path.exists():
-        age = now.timestamp() - cache_path.stat().st_mtime
-        if age < 6 * 3600:  # 6h
-            cache_age_ok = True
-
-    if cache_age_ok:
-        print(f"  📦 Base map: cache OK ({cache_path})")
+        print(f"  📦 Base map: cache OK")
         base_img = Image.open(cache_path).convert("RGBA")
     else:
         base_img = download_base_image(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, api_key)
@@ -859,20 +854,12 @@ def capture_zone(zone_name, zone_url, api_key, now):
             return 0
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         base_img.save(str(cache_path), "PNG")
-        print(f"  💾 Base map cachée: {cache_path}")
-
-    # Archiver la carte de base (journalier + horodaté)
-    base_dir = OUTPUT_DIR / date_str / "_base"
-    base_dir.mkdir(parents=True, exist_ok=True)
-    base_archive = base_dir / f"{date_str}-{time_str}_{zone_name}_base.jpg"
-    if not cache_age_ok or not base_archive.exists():
-        base_img.convert("RGB").save(str(base_archive), "JPEG", quality=90)
-        print(f"  📁 Base archivée: {base_archive}")
+        print(f"  💾 Base map cachée localement")
 
     # 2. Traffic Flow (vector tiles)
     flow_img = download_vector_flow(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, api_key)
 
-    # 3. Incidents
+    # 3. Incidents (vector tiles)
     inc_img = download_incidents(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, api_key)
 
     # 4. Composer l'image finale
@@ -880,7 +867,7 @@ def capture_zone(zone_name, zone_url, api_key, now):
     composite = Image.alpha_composite(composite, flow_img)
     composite = Image.alpha_composite(composite, inc_img)
 
-    # 5. Sauvegarder — structure : captures/YYYY-MM-DD/zone_name/YYYY-MM-DD-HHMM_zone_name.jpg
+    # 5. Sauvegarder — captures/YYYY-MM-DD/zone_name/YYYY-MM-DD-HHMM_zone_name.jpg
     zone_dir = OUTPUT_DIR / date_str / zone_name
     zone_dir.mkdir(parents=True, exist_ok=True)
     filename = f"{date_str}-{time_str}_{zone_name}.jpg"
@@ -892,21 +879,61 @@ def capture_zone(zone_name, zone_url, api_key, now):
     return counter
 
 
+def save_bases(api_key):
+    """
+    Télécharge et archive les cartes de base — appelée 1× par run.
+    Structure : bases/YYYY-MM-DD/zone_name/YYYY-MM-DD-HHMM_zone_name_base.jpg
+    Met aussi à jour le cache local (.base-cache/) pour les cycles suivants.
+    """
+    now = datetime.now(TIMEZONE)
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H%M")
+
+    print(f"\n{'='*60}")
+    print(f"SAUVEGARDE CARTES DE BASE — {now.strftime('%Y-%m-%d %H:%M %Z')}")
+    print(f"{'='*60}")
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    for zone_name, zone_url in ZONES.items():
+        lat, lon, zoom = parse_zone_url(zone_url)
+        print(f"\n[{zone_name}] zoom={zoom}")
+
+        base_img = download_base_image(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, api_key)
+        if base_img is None:
+            print(f"  ✗ Échec téléchargement base")
+            continue
+
+        # Cache local pour les cycles
+        cache_path = CACHE_DIR / f"{zone_name}_z{zoom}.png"
+        base_img.save(str(cache_path), "PNG")
+        print(f"  💾 Cache local: {cache_path}")
+
+        # Archivage — bases/YYYY-MM-DD/zone_name/YYYY-MM-DD-HHMM_zone_name_base.jpg
+        base_dir = BASES_DIR / date_str / zone_name
+        base_dir.mkdir(parents=True, exist_ok=True)
+        base_path = base_dir / f"{date_str}-{time_str}_{zone_name}_base.jpg"
+        base_img.convert("RGB").save(str(base_path), "JPEG", quality=90)
+        size_kb = base_path.stat().st_size / 1024
+        print(f"  📁 Archivé: {base_path} ({size_kb:.0f} KB)")
+
+
 def rotate_old_days():
-    """Supprime les captures de plus de RETENTION_DAYS jours."""
-    if not OUTPUT_DIR.exists():
-        return
+    """Supprime les captures et bases de plus de RETENTION_DAYS jours."""
     cutoff = datetime.now(TIMEZONE).date() - timedelta(days=RETENTION_DAYS)
-    for day_dir in OUTPUT_DIR.iterdir():
-        if day_dir.is_dir() and day_dir.name.startswith("20"):
-            try:
-                folder_date = datetime.strptime(day_dir.name, "%Y-%m-%d").date()
-                if folder_date < cutoff:
-                    import shutil
-                    shutil.rmtree(day_dir)
-                    print(f"  🗑 Supprimé: {day_dir}")
-            except ValueError:
-                pass
+    for root_dir in [OUTPUT_DIR, BASES_DIR]:
+        if not root_dir.exists():
+            continue
+        for day_dir in root_dir.iterdir():
+            if day_dir.is_dir() and day_dir.name.startswith("20"):
+                try:
+                    folder_date = datetime.strptime(day_dir.name, "%Y-%m-%d").date()
+                    if folder_date < cutoff:
+                        import shutil
+                        shutil.rmtree(day_dir)
+                        print(f"  🗑 Supprimé: {root_dir.name}/{day_dir.name}")
+                except ValueError:
+                    pass
 
 
 def clear_stale_cache():
@@ -923,6 +950,12 @@ def clear_stale_cache():
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="TomTom Traffic Capture — Vector Flow")
+    parser.add_argument("--save-bases", action="store_true",
+                        help="Télécharger et archiver les cartes de base (1× par run)")
+    args = parser.parse_args()
+
     api_key = os.environ.get("TOMTOM_API_KEY", "")
     if not api_key:
         print("✗ TOMTOM_API_KEY non définie")
@@ -942,37 +975,33 @@ if __name__ == "__main__":
 
     clear_stale_cache()
 
-    counter = 0  # Reset du compteur global
-    errors = 0
+    if args.save_bases:
+        # Mode base uniquement — 1× par run
+        save_bases(api_key)
+    else:
+        # Mode cycle — capture flow + incidents
+        counter = 0
+        errors = 0
 
-    for zone_name, zone_url in ZONES.items():
-        try:
-            capture_zone(zone_name, zone_url, api_key, now)
-        except Exception as e:
-            print(f"[{zone_name}] ✗ Erreur: {e}")
-            import traceback
-            traceback.print_exc()
-            errors += 1
+        for zone_name, zone_url in ZONES.items():
+            try:
+                capture_zone(zone_name, zone_url, api_key, now)
+            except Exception as e:
+                print(f"[{zone_name}] ✗ Erreur: {e}")
+                import traceback
+                traceback.print_exc()
+                errors += 1
 
-    # Résumé
-    print(f"\n{'═'*60}")
-    print(f"Résumé: {len(ZONES) - errors}/{len(ZONES)} zones OK")
-    print(f"Requêtes API: {counter}")
+        # Résumé
+        print(f"\n{'═'*60}")
+        print(f"Résumé: {len(ZONES) - errors}/{len(ZONES)} zones OK")
+        print(f"Requêtes API: {counter}")
+        print(f"{'═'*60}")
 
-    # Estimation budget
-    # Static image: 1/zone/6h = ~12/jour
-    # Vector tiles: ~12 tuiles/zone/cycle × 3 zones × 144 cycles = ~5200/jour
-    # Incidents: 1/zone/cycle × 3 × 144 = 432/jour (non-tuile)
-    cycles_per_day = 144  # toutes les 10 min
-    estimated_daily = counter * cycles_per_day
-    print(f"Budget journalier estimé: ~{estimated_daily} requêtes "
-          f"({estimated_daily * 100 / 50000:.0f}% du quota)")
-    print(f"{'═'*60}")
+        if errors == len(ZONES):
+            sys.exit(1)
 
     try:
         rotate_old_days()
     except Exception as e:
         print(f"[rotation] ✗ Erreur: {e}")
-
-    if errors == len(ZONES):
-        sys.exit(1)
