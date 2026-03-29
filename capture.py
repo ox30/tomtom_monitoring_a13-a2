@@ -26,6 +26,7 @@ import struct
 import requests
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from io import BytesIO
 from PIL import Image, ImageDraw
 
@@ -232,6 +233,7 @@ TILE_SIZE       = 512       # Taille des tuiles vectorielles (en pixels de rendu
 RETENTION_DAYS  = 7
 OUTPUT_DIR      = Path("captures")
 CACHE_DIR       = Path(".base-cache")
+TIMEZONE        = ZoneInfo("Europe/Zurich")
 
 # Filtrage des types de route par niveau de zoom
 # Plus le zoom est faible (vue large), moins on affiche de routes
@@ -613,6 +615,9 @@ def capture_zone(zone_name, zone_url, api_key, now):
     print(f"\n{'─'*60}")
     print(f"[{zone_name}] lat={lat} lon={lon} zoom={zoom}")
 
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H%M")
+
     # 1. Carte de base (cachée — ne change pas souvent)
     cache_path = CACHE_DIR / f"{zone_name}_z{zoom}.png"
     cache_age_ok = False
@@ -633,6 +638,14 @@ def capture_zone(zone_name, zone_url, api_key, now):
         base_img.save(str(cache_path), "PNG")
         print(f"  💾 Base map cachée: {cache_path}")
 
+    # Archiver la carte de base (journalier + horodaté)
+    base_dir = OUTPUT_DIR / date_str / "_base"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    base_archive = base_dir / f"{date_str}-{time_str}_{zone_name}_base.jpg"
+    if not cache_age_ok or not base_archive.exists():
+        base_img.convert("RGB").save(str(base_archive), "JPEG", quality=90)
+        print(f"  📁 Base archivée: {base_archive}")
+
     # 2. Traffic Flow (vector tiles)
     flow_img = download_vector_flow(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, api_key)
 
@@ -644,21 +657,14 @@ def capture_zone(zone_name, zone_url, api_key, now):
     composite = Image.alpha_composite(composite, flow_img)
     composite = Image.alpha_composite(composite, inc_img)
 
-    # 5. Sauvegarder
-    date_dir = OUTPUT_DIR / now.strftime("%Y-%m-%d")
-    date_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{zone_name}_{now.strftime('%H%M')}.jpg"
-    out_path = date_dir / filename
+    # 5. Sauvegarder — structure : captures/YYYY-MM-DD/zone_name/YYYY-MM-DD-HHMM_zone_name.jpg
+    zone_dir = OUTPUT_DIR / date_str / zone_name
+    zone_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{date_str}-{time_str}_{zone_name}.jpg"
+    out_path = zone_dir / filename
     composite.convert("RGB").save(str(out_path), "JPEG", quality=88)
     size_kb = out_path.stat().st_size / 1024
     print(f"  ✅ {out_path} ({size_kb:.0f} KB)")
-
-    # Copie pour inspection de la carte de base
-    debug_dir = OUTPUT_DIR / "_base"
-    debug_dir.mkdir(parents=True, exist_ok=True)
-    debug_path = debug_dir / f"{zone_name}_base.jpg"
-    if not debug_path.exists() or not cache_age_ok:
-        base_img.convert("RGB").save(str(debug_path), "JPEG", quality=90)
 
     return counter
 
@@ -667,12 +673,12 @@ def rotate_old_days():
     """Supprime les captures de plus de RETENTION_DAYS jours."""
     if not OUTPUT_DIR.exists():
         return
-    cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
+    cutoff = datetime.now(TIMEZONE).date() - timedelta(days=RETENTION_DAYS)
     for day_dir in OUTPUT_DIR.iterdir():
         if day_dir.is_dir() and day_dir.name.startswith("20"):
             try:
-                dir_date = datetime.strptime(day_dir.name, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                if dir_date < cutoff:
+                folder_date = datetime.strptime(day_dir.name, "%Y-%m-%d").date()
+                if folder_date < cutoff:
                     import shutil
                     shutil.rmtree(day_dir)
                     print(f"  🗑 Supprimé: {day_dir}")
@@ -701,8 +707,8 @@ if __name__ == "__main__":
         print("  → ou Settings > Secrets > TOMTOM_API_KEY dans GitHub")
         sys.exit(1)
 
-    now = datetime.now(timezone.utc)
-    print(f"═══ TomTom Vector Flow Capture — {now.strftime('%Y-%m-%d %H:%M UTC')} ═══")
+    now = datetime.now(TIMEZONE)
+    print(f"═══ TomTom Vector Flow Capture — {now.strftime('%Y-%m-%d %H:%M %Z')} ═══")
 
     # Afficher les zones configurées
     print("\nZones configurées:")
