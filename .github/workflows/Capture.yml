@@ -1,171 +1,78 @@
-name: TomTom Traffic Capture (Hybrid)
+name: TomTom Traffic Capture (Vector Flow)
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
   workflow_dispatch:
-    inputs:
-      interval:
-        description: "Intervalle entre captures (minutes)"
-        required: false
-        default: "10"
-        type: string
+  schedule:
+    # Toutes les 6h — le workflow tourne ~6h avec des cycles de 10 min
+    - cron: '0 0,6,12,18 * * *'
 
-concurrency:
-  group: tomtom-capture
-  cancel-in-progress: false
+permissions:
+  contents: write
 
 jobs:
-  capture-loop:
+  capture:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    timeout-minutes: 370  # 6h + marge
 
     steps:
-      - name: Checkout code (main)
+      - name: Checkout main
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
-
-      - name: Restaurer les captures existantes
-        run: |
-          git fetch origin captures --depth=1 2>/dev/null && \
-          git checkout origin/captures -- captures/ 2>/dev/null && \
-          echo "✓ Captures précédentes restaurées" || \
-          echo "→ Première exécution — pas de captures précédentes"
+          ref: main
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.12'
 
       - name: Install dependencies
-        run: |
-          pip install requests Pillow playwright
-          playwright install chromium --with-deps
+        run: pip install requests Pillow
 
       - name: Vérifier les fichiers requis
         run: |
           if [ ! -f capture.py ]; then
-            echo "✗ capture.py introuvable !"
-            ls -la
+            echo "✗ capture.py introuvable dans le repo !"
+            echo "  Assurez-vous que capture.py est pushé sur la branche main."
             exit 1
           fi
-          echo "✓ capture.py trouvé"
 
-      - name: Boucle de capture
+      - name: Checkout branche captures
+        run: |
+          git fetch origin captures || true
+          if git rev-parse --verify origin/captures >/dev/null 2>&1; then
+            git checkout captures
+            git merge main --no-edit --strategy-option theirs || true
+          else
+            git checkout -b captures
+          fi
+
+      - name: Boucle de capture (10 min × 36 cycles = 6h)
         env:
           TOMTOM_API_KEY: ${{ secrets.TOMTOM_API_KEY }}
-          INTERVAL_MIN: ${{ github.event.inputs.interval || '10' }}
         run: |
-          set -euo pipefail
+          CYCLES=36
+          echo "═══ Démarrage: ${CYCLES} cycles de 10 min ═══"
 
-          MAX_RUNTIME=20700
-          INTERVAL=$((INTERVAL_MIN * 60))
-          START_TIME=$(date +%s)
-          CYCLE=0
-
-          # ── Préparation git ────────────────────────────────────
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          cp capture.py /tmp/capture.py
-
-          git checkout --orphan captures-work
-          git rm -rf --cached . -q 2>/dev/null || true
-
-          cp /tmp/capture.py ./capture.py
-
-          cat > README.md << 'EOF'
-          # Captures TomTom — Trafic A13 (Grisons)
-
-          Captures automatiques **hybrides** (Playwright + API TomTom) toutes les ~10 min.
-          Fuseau horaire : **Europe/Zurich** (CET/CEST).
-
-          ## Méthode
-
-          Chaque capture superpose 3 couches :
-          1. **Carte de base** — Playwright (screenshot vectoriel plan.tomtom.com)
-          2. **Traffic Flow** — API TomTom Raster Flow Tiles
-          3. **Traffic Incidents** — API Incident Details v5 (lignes pointillées)
-
-          La carte de base est capturée 1× par démarrage de workflow (~6h).
-          Les couches trafic sont mises à jour toutes les 10 minutes.
-
-          ## Télécharger
-
-          | Quoi | Comment |
-          |---|---|
-          | **Une capture** | Naviguer dans les dossiers → clic sur l'image → **Download** |
-          | **Tout (ZIP)** | [📦 Télécharger le ZIP](https://github.com/ox30/tomtom_monitoring_a13-a2/archive/refs/heads/captures.zip) |
-
-          ## Zones capturées
-
-          | Zone | Couverture | Zoom |
-          |---|---|---|
-          | `zone_globale_A2_A13` | Vue d'ensemble A2–A13 | 8.55 |
-          | `zone_A13_Chur` | Secteur A13 autour de Chur | 9.75 |
-          | `zone_Chur_Isla-T` | Détail Chur – Isla/Thusis | 12.17 |
-
-          ## Rétention
-
-          Les captures de plus de **7 jours** sont automatiquement supprimées.
-          EOF
-
-          sed -i 's/^          //' README.md
-
-          git add captures/ README.md 2>/dev/null || true
-          git commit --allow-empty -m "captures init"
-
-          echo ""
-          echo "╔════════════════════════════════════════════════════════════╗"
-          echo "║  TomTom Hybrid Capture — intervalle : ${INTERVAL_MIN} min            ║"
-          echo "║  Carte de base : Playwright (1× au démarrage)            ║"
-          echo "║  Flow + Incidents : API (toutes les ${INTERVAL_MIN} min)              ║"
-          echo "╚════════════════════════════════════════════════════════════╝"
-          echo ""
-
-          # ── Capture carte de base (Playwright, 1× par workflow) ─
-          echo "━━━ Capture cartes de base (Playwright) ━━━"
-          python capture.py --base-only || {
-            echo "✗ Échec capture base — abandon"
-            exit 1
-          }
-
-          # ── Boucle principale (flow + incidents via API) ────────
-          while true; do
-            CYCLE_START=$(date +%s)
-            CYCLE=$((CYCLE + 1))
-
-            ELAPSED=$((CYCLE_START - START_TIME))
-            if [ "$ELAPSED" -ge "$MAX_RUNTIME" ]; then
-              echo ""
-              echo "⏱ Durée max atteinte — fin de la boucle"
-              break
-            fi
-
-            REMAINING=$(( (MAX_RUNTIME - ELAPSED) / 60 ))
+          for CYCLE in $(seq 1 $CYCLES); do
             echo ""
-            echo "━━━ Cycle #${CYCLE} — $(TZ=Europe/Zurich date '+%H:%M %Z') — ${REMAINING} min restantes ━━━"
+            echo "──── Cycle ${CYCLE}/${CYCLES} — $(date -u '+%H:%M UTC') ────"
+            
+            python capture.py || echo "⚠ Erreur cycle ${CYCLE}"
 
-            python capture.py --cycle-only || echo "⚠ Erreur capture (cycle continue)"
+            # Commit et push
+            git add -A captures/ .base-cache/
+            TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -m "📸 ${TIMESTAMP}" --allow-empty || true
+            git push origin captures || true
 
-            git add captures/ README.md 2>/dev/null || git add README.md
-            git commit --amend --allow-empty -m "captures $(date -u '+%Y-%m-%d %H:%M') UTC" -q
-            git push --force origin captures-work:captures -q
-            echo "✓ Push OK"
-
-            CYCLE_END=$(date +%s)
-            CYCLE_DURATION=$((CYCLE_END - CYCLE_START))
-            SLEEP_TIME=$((INTERVAL - CYCLE_DURATION))
-
-            if [ "$SLEEP_TIME" -gt 0 ]; then
-              echo "💤 Prochain cycle dans ${SLEEP_TIME}s (capture: ${CYCLE_DURATION}s)"
-              sleep "$SLEEP_TIME"
-            else
-              echo "⚠ Cycle a pris ${CYCLE_DURATION}s — enchaîne"
+            # Attendre 10 min (sauf dernier cycle)
+            if [ "$CYCLE" -lt "$CYCLES" ]; then
+              echo "⏳ Prochain cycle dans 10 min..."
+              sleep 600
             fi
           done
 
           echo ""
-          echo "═══ Boucle terminée après ${CYCLE} cycles ═══"
+          echo "═══ Boucle terminée après ${CYCLES} cycles ═══"
