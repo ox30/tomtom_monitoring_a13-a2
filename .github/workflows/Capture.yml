@@ -24,7 +24,7 @@ on:
       map_style:
         description: "Style du fond de carte"
         required: false
-        default: "light"
+        default: "night"
         type: choice
         options:
           - "light"
