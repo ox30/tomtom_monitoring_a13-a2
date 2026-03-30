@@ -32,7 +32,7 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from io import BytesIO
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageEnhance
 
 # ─── Protobuf minimal parser ─────────────────────────────────────────────────
 # Parseur protobuf léger intégré — pas de dépendance externe requise.
@@ -241,6 +241,17 @@ BASES_DIR       = Path("bases")       # Cartes de base 1× par run
 CACHE_DIR       = Path(".base-cache") # Cache local (pas commité)
 TIMEZONE        = ZoneInfo("Europe/Zurich")
 
+# Style de la carte de base — configurable via env BASE_MAP_STYLE au lancement
+# "main"  → couleurs standard TomTom (défaut API)
+# "light" → fond gris clair désaturé (comme plan.tomtom.com mode Light)
+# "night" → mode nuit TomTom (sombre)
+#
+# Paramètres du mode "light" — ajustez pour un fond plus/moins contrasté :
+BASE_MAP_STYLE         = os.environ.get("BASE_MAP_STYLE", "light")
+LIGHT_SATURATION       = 0.05    # 0.0 = gris pur, 1.0 = couleurs originales
+LIGHT_BRIGHTNESS       = 1.1     # > 1.0 = plus clair, 1.0 = pas de changement
+LIGHT_CONTRAST         = 1.5    # < 1.0 = moins contrasté (plus doux), 1.0 = original
+
 # Filtrage des types de route par niveau de zoom
 # Plus le zoom est faible (vue large), moins on affiche de routes
 ROAD_TYPES_BY_ZOOM = {
@@ -270,7 +281,7 @@ LINE_WIDTH = {
 }
 DEFAULT_WIDTH = (4, 3)
 
-# ─── Charte visuelle TomTom relative0 adaptée────────────────────────────────────────
+# ─── Charte visuelle TomTom relative0 adaptée ────────────────────────────────────────
 # Couleurs adapté extraites de la documentation officielle TomTom
 # https://developer.tomtom.com/traffic-api/documentation/traffic-flow/raster-flow-tiles
 
@@ -539,14 +550,43 @@ def api_get(url, binary=False):
     return None
 
 
+def _apply_light_style(img):
+    """
+    Transforme une image carte en version "Light" (fond gris clair désaturé).
+    Reproduit le rendu de plan.tomtom.com en mode Light.
+    Paramètres configurables : LIGHT_SATURATION, LIGHT_BRIGHTNESS, LIGHT_CONTRAST.
+    """
+    # Travailler en RGB pour les transformations
+    rgb = img.convert("RGB")
+
+    # 1. Désaturer (retirer les couleurs)
+    enhancer = ImageEnhance.Color(rgb)
+    rgb = enhancer.enhance(LIGHT_SATURATION)
+
+    # 2. Éclaircir
+    enhancer = ImageEnhance.Brightness(rgb)
+    rgb = enhancer.enhance(LIGHT_BRIGHTNESS)
+
+    # 3. Réduire le contraste (adoucir)
+    enhancer = ImageEnhance.Contrast(rgb)
+    rgb = enhancer.enhance(LIGHT_CONTRAST)
+
+    # Reconvertir en RGBA
+    result = rgb.convert("RGBA")
+    return result
+
+
 def download_base_image(lat, lon, zoom, width, height, api_key):
     """
     Télécharge la carte de base via l'API Static Image de TomTom.
-    Une seule requête HTTP — pas de navigateur, pas d'assemblage de tuiles.
+    Applique le style configuré (main, light, night).
     """
     # Limiter à 8192x8192 (max API)
     w = min(width, 8192)
     h = min(height, 8192)
+
+    # Style API : "main" ou "night" (pas de "light" côté API)
+    api_style = "night" if BASE_MAP_STYLE == "night" else "main"
 
     url = (
         f"https://api.tomtom.com/map/1/staticimage"
@@ -555,16 +595,19 @@ def download_base_image(lat, lon, zoom, width, height, api_key):
         f"&zoom={zoom}"
         f"&width={w}&height={h}"
         f"&format=png"
-        f"&layer=basic&style=main"
+        f"&layer=basic&style={api_style}"
         f"&language=de-DE"
     )
-    print(f"  📍 Base map: {w}×{h} zoom={zoom}")
+    print(f"  📍 Base map: {w}×{h} zoom={zoom} style={BASE_MAP_STYLE}")
     data = api_get(url, binary=True)
     if data:
         img = Image.open(BytesIO(data)).convert("RGBA")
         # Redimensionner si nécessaire
         if img.size != (width, height):
             img = img.resize((width, height), Image.LANCZOS)
+        # Appliquer le style "light" (désaturation + éclaircissement)
+        if BASE_MAP_STYLE == "light":
+            img = _apply_light_style(img)
         return img
     return None
 

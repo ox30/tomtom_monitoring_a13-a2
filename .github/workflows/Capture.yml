@@ -21,6 +21,15 @@ on:
         options:
           - "true"
           - "false"
+      map_style:
+        description: "Style du fond de carte"
+        required: false
+        default: "light"
+        type: choice
+        options:
+          - "light"
+          - "main"
+          - "night"
 
 concurrency:
   group: tomtom-capture
@@ -66,6 +75,7 @@ jobs:
           INTERVAL_SEC: ${{ github.event.inputs.interval || '600' }}
           MAX_CYCLES: ${{ github.event.inputs.cycles || '0' }}
           INCIDENTS_ENABLED: ${{ github.event.inputs.incidents || 'true' }}
+          BASE_MAP_STYLE: ${{ github.event.inputs.map_style || 'light' }}
         run: |
           set -euo pipefail
 
