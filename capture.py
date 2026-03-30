@@ -248,7 +248,7 @@ TIMEZONE        = ZoneInfo("Europe/Zurich")
 #
 # Paramètres du mode "light" — ajustez pour un fond plus/moins contrasté :
 BASE_MAP_STYLE         = "light"
-LIGHT_SATURATION       = 0.15    # 0.0 = gris pur, 1.0 = couleurs originales
+LIGHT_SATURATION       = 0.05    # 0.0 = gris pur, 1.0 = couleurs originales
 LIGHT_BRIGHTNESS       = 1.1     # > 1.0 = plus clair, 1.0 = pas de changement
 LIGHT_CONTRAST         = 1.5    # < 1.0 = moins contrasté (plus doux), 1.0 = original
 
