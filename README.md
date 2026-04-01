@@ -12,6 +12,8 @@ Le système superpose 3 couches via Pillow pour produire une image composite :
 
 Chaque couche est dessinée avec un **décalage directionnel** : le tube est poussé vers la droite du sens de circulation, ce qui permet de distinguer les deux directions même en vue dézoomée.
 
+Le rendu utilise un **supersampling** : les couches vectorielles sont dessinées à 2× la résolution finale, puis réduites avec un filtre LANCZOS. Cela produit des lignes anti-aliasées (lissées) sans aucune requête API supplémentaire.
+
 ## Workflow
 
 Le workflow GitHub Actions fonctionne en boucle continue :
@@ -50,6 +52,8 @@ bases/                                           ← cartes de fond (1× par run
 
 Rétention automatique : **7 jours**. Les dossiers plus anciens sont supprimés à chaque exécution.
 
+**Poids indicatif** (4 zones, `SUPERSAMPLE=2`, `OUTPUT_QUALITY=95`) : ~1.45 MB/cycle → ~204 MB/jour → ~1.4 GB sur 7 jours. Pour rester sous la recommandation GitHub de 1 GB, réduire la rétention à 3 jours ou diminuer `OUTPUT_QUALITY`.
+
 ## Configuration
 
 Tout le paramétrage se fait dans `capture.py`, section `# ─── Configuration`. Rien à changer dans le workflow.
@@ -68,6 +72,24 @@ ZONES = {
 ```
 
 Pour ajouter une zone : naviguer sur [plan.tomtom.com](https://plan.tomtom.com/), zoomer à la vue souhaitée, copier l'URL, ajouter une ligne dans `ZONES`.
+
+### Qualité de rendu
+
+```python
+# Supersampling — rendu interne à N× la résolution, downscale LANCZOS final.
+# Produit des lignes anti-aliasées sans surcoût API. Aucun impact sur le quota TomTom.
+# 1 = désactivé (comportement original)
+# 2 = recommandé — bon compromis qualité/RAM (~600 MB pic)
+# 3 = meilleur rendu, RAM ~3× plus élevée
+SUPERSAMPLE = 2
+
+# Qualité JPEG de sortie.
+# 88 = valeur d'origine (fichiers plus légers, légère compression visible sur les traits)
+# 95 = recommandé — réduit les artefacts de compression autour des tubes flow/incidents
+OUTPUT_QUALITY = 95
+```
+
+> **Note :** augmenter `SUPERSAMPLE` ou `OUTPUT_QUALITY` améliore la qualité visuelle mais augmente le poids des fichiers et donc la consommation de stockage GitHub.
 
 ### Style de la carte de base
 
@@ -136,6 +158,8 @@ LINE_WIDTH = {
     "Minor local road":   (1, 1),
 }
 ```
+
+> **Astuce supersampling :** avec `SUPERSAMPLE=2`, le downscale LANCZOS affine légèrement les traits. Si les tubes paraissent trop fins, augmenter les valeurs d'un cran (ex. Motorway `(7, 6)`) compense cet effet.
 
 ### Couleurs du trafic (flow)
 
@@ -269,10 +293,11 @@ Le script affiche un rapport de consommation au début de chaque exécution :
   Par run (5h45):  4324 requêtes
   Par jour (×4):   17296 / 50000 = 34.6%
   Marge:           ~7 zones supplémentaires possibles
+  🔍 Supersampling ×2 actif — qualité améliorée, zéro surcoût API
   ✓ Budget confortable
 ```
 
-Le quota gratuit TomTom est de **50'000 requêtes/jour**. Un avertissement s'affiche au-delà de 70%.
+Le quota gratuit TomTom est de **50'000 requêtes/jour**. Un avertissement s'affiche au-delà de 70%. Le supersampling n'a **aucun impact** sur ce quota.
 
 ## Installation
 

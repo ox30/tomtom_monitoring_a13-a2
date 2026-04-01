@@ -241,6 +241,19 @@ BASES_DIR       = Path("bases")       # Cartes de base 1× par run
 CACHE_DIR       = Path(".base-cache") # Cache local (pas commité)
 TIMEZONE        = ZoneInfo("Europe/Zurich")
 
+# ─── Supersampling ────────────────────────────────────────────────────────────
+# Rendu interne à N× la résolution finale, puis downscale LANCZOS.
+# Produit des lignes anti-aliasées (lissées) sans aucun surcoût API.
+# 1 = désactivé (comportement original)
+# 2 = bon compromis qualité/RAM (~600 MB pic en RAM)
+# 3 = meilleur rendu mais RAM ~3× plus élevée
+SUPERSAMPLE = 2
+
+# ─── Format de sortie ────────────────────────────────────────────────────────
+# Qualité JPEG — relevée de 88 à 95 pour réduire les artefacts de compression
+# autour des traits de flow et d'incidents.
+OUTPUT_QUALITY = 95
+
 # Style de la carte de base — configurable via env BASE_MAP_STYLE au lancement
 # "main"  → couleurs standard TomTom (défaut API)
 # "light" → fond gris clair désaturé (comme plan.tomtom.com mode Light)
@@ -268,18 +281,18 @@ ROAD_TYPES_BY_ZOOM = {
 # Épaisseur des lignes par type de route (outline, main)
 # Reproduit la hiérarchie visuelle de plan.tomtom.com
 LINE_WIDTH = {
-    "Motorway":         (5, 4),
-    "International road": (4, 4),
-    "Major road":       (4, 3),
-    "Secondary road":   (3, 3),
-    "Connecting road":  (3, 2),
-    "Major local road": (2, 2),
-    "Local road":       (2, 1),
-    "Minor local road": (1, 1),
-    "Non public road":  (0, 1),
-    "Parking road":     (0, 1),
+    "Motorway":         (9, 7),
+    "International road": (7, 7),
+    "Major road":       (7, 6),
+    "Secondary road":   (6, 6),
+    "Connecting road":  (6, 5),
+    "Major local road": (5, 5),
+    "Local road":       (5, 4),
+    "Minor local road": (4, 4),
+    "Non public road":  (3, 4),
+    "Parking road":     (3, 3),
 }
-DEFAULT_WIDTH = (4, 3)
+DEFAULT_WIDTH = (7, 6)
 
 # ─── Charte visuelle TomTom relative0 adaptée ────────────────────────────────────────
 # Couleurs adapté extraites de la documentation officielle TomTom
@@ -396,16 +409,16 @@ HATCHED_GREY_COLORS = ((122, 128, 144, 255), (224, 224, 224, 255)) # gris-bleu +
 
 # Épaisseur des incidents par type de route (légèrement plus épais que le flow)
 INCIDENT_WIDTH = {
-    "Motorway":           (6, 5),
-    "International road": (5, 5),
-    "Major road":         (5, 4),
-    "Secondary road":     (4, 4),
-    "Connecting road":    (4, 3),
-    "Major local road":   (3, 3),
-    "Local road":         (3, 2),
-    "Minor local road":   (2, 2),
+    "Motorway":           (9, 8),
+    "International road": (8, 8),
+    "Major road":         (8, 7),
+    "Secondary road":     (7, 7),
+    "Connecting road":    (7, 6),
+    "Major local road":   (6, 6),
+    "Local road":         (6, 5),
+    "Minor local road":   (5, 5),
 }
-INCIDENT_DEFAULT_WIDTH = (5, 4)
+INCIDENT_DEFAULT_WIDTH = (8, 7)
 
 # ─── Décalage directionnel (tube côté droit du sens de circulation) ───────────
 # Chaque tube est décalé vers la droite et affiné pour séparer les deux sens.
@@ -485,11 +498,9 @@ def get_tile_grid(lat, lon, zoom, width, height, tile_size):
 def _offset_polyline(coords, offset_px):
     """
     Décale une polyligne vers la DROITE du sens de circulation.
-    En screen coords (Y vers le bas), le perpendiculaire droit = (-uy, ux).
-
+     En screen coords (Y vers le bas), le perpendiculaire droit = (-uy, ux).
     offset_px > 0 → décale à droite du sens de marche
     offset_px < 0 → décale à gauche
-
     Retourne une nouvelle liste de coordonnées décalées.
     """
     if len(coords) < 2 or abs(offset_px) < 0.5:
@@ -553,9 +564,8 @@ def api_get(url, binary=False):
 def _apply_light_style(img):
     """
     Transforme une image carte en version "Light" (fond gris clair désaturé).
-    Reproduit le rendu de plan.tomtom.com en mode Light.
-    Paramètres configurables : LIGHT_SATURATION, LIGHT_BRIGHTNESS, LIGHT_CONTRAST.
     """
+  
     # Travailler en RGB pour les transformations
     rgb = img.convert("RGB")
 
@@ -572,15 +582,17 @@ def _apply_light_style(img):
     rgb = enhancer.enhance(LIGHT_CONTRAST)
 
     # Reconvertir en RGBA
-    result = rgb.convert("RGBA")
-    return result
+    return rgb.convert("RGBA")
 
 
 def download_base_image(lat, lon, zoom, width, height, api_key):
     """
     Télécharge la carte de base via l'API Static Image de TomTom.
     Applique le style configuré (main, light, night).
+    width/height sont les dimensions de rendu (peuvent être supersamplées).
+    L'API est limitée à 8192×8192 — on clamp et on redimensionne si nécessaire.
     """
+
     # Limiter à 8192x8192 (max API)
     w = min(width, 8192)
     h = min(height, 8192)
@@ -612,16 +624,24 @@ def download_base_image(lat, lon, zoom, width, height, api_key):
     return None
 
 
-def download_vector_flow(lat, lon, zoom, width, height, api_key):
+def download_vector_flow(lat, lon, zoom, width, height, api_key, tile_render_size=None):
     """
-    Télécharge les tuiles vectorielles de trafic flow (.pbf),
-    parse les segments et les dessine avec la charte relative0 de TomTom.
+    Télécharge les tuiles vectorielles de trafic flow (.pbf) et les dessine.
+
+    tile_render_size : taille de rendu d'une tuile en pixels (défaut = TILE_SIZE).
+                       En mode supersampling, passer TILE_SIZE * SUPERSAMPLE.
+                       Les requêtes API restent identiques (zoom/x/y inchangés).
     """
     # Déterminer les types de route à afficher pour ce zoom
+    if tile_render_size is None:
+        tile_render_size = TILE_SIZE
+
     road_types = ROAD_TYPES_BY_ZOOM.get(zoom, [0, 1, 2, 3])
     road_types_param = "[" + ",".join(str(r) for r in road_types) + "]"
 
-    tiles, origin_px, origin_py = get_tile_grid(lat, lon, zoom, width, height, TILE_SIZE)
+    tiles, origin_px, origin_py = get_tile_grid(
+        lat, lon, zoom, width, height, tile_render_size
+    )
 
     # Image transparente pour le flow
     flow_img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
@@ -679,8 +699,8 @@ def download_vector_flow(lat, lon, zoom, width, height, api_key):
                 # Convertir coords tuile (0-extent) en pixels viewport
                 pixel_line = []
                 for tx_coord, ty_coord in line:
-                    px = px_off + (tx_coord / extent) * TILE_SIZE
-                    py = py_off + (ty_coord / extent) * TILE_SIZE
+                    px = px_off + (tx_coord / extent) * tile_render_size
+                    py = py_off + (ty_coord / extent) * tile_render_size
                     pixel_line.append((px, py))
 
                 # Simplifier : ignorer les segments hors viewport (avec marge)
@@ -716,17 +736,22 @@ def download_vector_flow(lat, lon, zoom, width, height, api_key):
     return flow_img
 
 
-def download_incidents(lat, lon, zoom, width, height, api_key):
+def download_incidents(lat, lon, zoom, width, height, api_key, tile_render_size=None):
     """
-    Télécharge les incidents via Vector Incident Tiles (.pbf),
+    Télécharge les incidents via Vector Incident Tiles (.pbf) et les dessine.
     trie par priorité (INCIDENT_PRIORITY), puis dessine :
       - hatched_red  : tube losanges rouge/blanc (fermetures)
       - hatched_grey : tube losanges gris/blanc (travaux, météo)
       - solid        : tube plein couleur par magnitude (bouchons)
 
-    Ordre de dessin : priorité basse d'abord, haute par-dessus.
+    tile_render_size : même principe que pour download_vector_flow.
     """
-    tiles, origin_px, origin_py = get_tile_grid(lat, lon, zoom, width, height, TILE_SIZE)
+    if tile_render_size is None:
+        tile_render_size = TILE_SIZE
+
+    tiles, origin_px, origin_py = get_tile_grid(
+        lat, lon, zoom, width, height, tile_render_size
+    )
 
     inc_img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(inc_img)
@@ -735,7 +760,7 @@ def download_incidents(lat, lon, zoom, width, height, api_key):
     n_downloaded = 0
 
     # Phase 1 : Collecter tous les incidents
-    all_incidents = []  # [(priority, style, icon_cat, magnitude, outline_w, main_w, coords)]
+    all_incidents = []
 
     for tile_x, tile_y, px_off, py_off in tiles:
         max_tile = 2 ** zoom - 1
@@ -796,8 +821,8 @@ def download_incidents(lat, lon, zoom, width, height, api_key):
 
                 pixel_line = []
                 for tx_coord, ty_coord in line:
-                    px = px_off + (tx_coord / extent) * TILE_SIZE
-                    py = py_off + (ty_coord / extent) * TILE_SIZE
+                    px = px_off + (tx_coord / extent) * tile_render_size
+                    py = py_off + (ty_coord / extent) * tile_render_size
                     pixel_line.append((px, py))
 
                 margin = 50
@@ -855,11 +880,6 @@ def download_incidents(lat, lon, zoom, width, height, api_key):
 def _draw_hatched_tube(draw, coords, colors, outline_w, main_w):
     """
     Dessine un tube hachuré TomTom le long d'une polyligne.
-    Motif : contour fin coloré → fond gris clair → carrés colorés pleine hauteur.
-    Les carrés touchent les bords haut et bas du tube.
-    Ratio : 1/3 carré coloré + 2/3 rectangle gris.
-
-    colors = (colored_part_rgba, grey_fill_rgba)
     """
     color, grey_fill = colors
 
@@ -882,7 +902,7 @@ def _draw_hatched_tube(draw, coords, colors, outline_w, main_w):
 
     # Parcourir le chemin et placer des carrés
     seg_idx = 0
-    seg_consumed = half_sq  # commencer décalé pour que le premier carré soit entier
+    seg_consumed = half_sq
 
     while seg_idx < len(coords) - 1:
         x0, y0 = coords[seg_idx]
@@ -895,16 +915,12 @@ def _draw_hatched_tube(draw, coords, colors, outline_w, main_w):
             continue
 
         ux, uy = (x1 - x0) / seg_len, (y1 - y0) / seg_len
-        # Normale (perpendiculaire au segment)
         nx, ny = -uy, ux
 
         while seg_consumed < seg_len:
-            # Centre du carré sur le chemin
             cx = x0 + ux * seg_consumed
             cy = y0 + uy * seg_consumed
 
-            # 4 coins du carré aligné avec la route
-            # Le carré est aussi large (le long de la route) que haut (perpendiculaire)
             corners = [
                 (cx - ux * half_sq + nx * half_w, cy - uy * half_sq + ny * half_w),
                 (cx + ux * half_sq + nx * half_w, cy + uy * half_sq + ny * half_w),
@@ -923,7 +939,6 @@ def _draw_hatched_tube(draw, coords, colors, outline_w, main_w):
 def parse_mvt_tile_incidents(data):
     """
     Parse une tuile MVT et retourne les features du layer 'Traffic incident flow'.
-    Même logique que parse_mvt_tile mais pour le layer incidents.
     """
     if not data or len(data) < 2:
         return []
@@ -938,7 +953,6 @@ def parse_mvt_tile_incidents(data):
         if isinstance(name, bytes):
             name = name.decode('utf-8', errors='ignore')
 
-        # On traite "Traffic incident flow" (lignes) — pas les POI (points)
         if name != "Traffic incident flow":
             continue
 
@@ -1007,7 +1021,22 @@ def capture_zone(zone_name, zone_url, api_key, now):
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H%M")
 
-    # 1. Carte de base (cache local uniquement)
+    # Dimensions de rendu interne (supersampling)
+    render_w = VIEWPORT_WIDTH  * SUPERSAMPLE
+    render_h = VIEWPORT_HEIGHT * SUPERSAMPLE
+    tile_render_size = TILE_SIZE * SUPERSAMPLE
+
+    if SUPERSAMPLE > 1:
+        print(f"  🔍 Supersampling ×{SUPERSAMPLE} — rendu {render_w}×{render_h} → downscale {VIEWPORT_WIDTH}×{VIEWPORT_HEIGHT}")
+
+    # 1. Carte de base
+    # IMPORTANT : la base map est TOUJOURS demandée à VIEWPORT_WIDTH × VIEWPORT_HEIGHT,
+    # indépendamment du supersampling. L'API Static Image TomTom utilise des tuiles
+    # internes de 512px — sa zone géographique correspond exactement au viewport 1920×1080.
+    # Si on demandait render_w × render_h (ex. 3840×2160), l'API couvrirait 2× la zone
+    # géographique → décalage entre fond de carte et couches vectorielles.
+    # On upscale ensuite en RAM (LANCZOS) avant de composer avec flow et incidents.
+    # Le cache est nommé sans _ss car il est indépendant du supersampling.
     cache_path = CACHE_DIR / f"{zone_name}_z{zoom}.png"
     if cache_path.exists():
         print(f"  📦 Base map: cache OK")
@@ -1021,29 +1050,46 @@ def capture_zone(zone_name, zone_url, api_key, now):
         base_img.save(str(cache_path), "PNG")
         print(f"  💾 Base map cachée localement")
 
-    # 2. Traffic Flow (vector tiles)
-    flow_img = download_vector_flow(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, api_key)
+    # Upscaler la base à la résolution de rendu pour la composition
+    if SUPERSAMPLE > 1:
+        base_img = base_img.resize((render_w, render_h), Image.LANCZOS)
 
-    # 3. Incidents (vector tiles) — désactivable via INCIDENTS_ENABLED=false
+    # 2. Traffic Flow — rendu à résolution supersamplée
+    flow_img = download_vector_flow(
+        lat, lon, zoom, render_w, render_h, api_key,
+        tile_render_size=tile_render_size
+    )
+
+    # 3. Incidents — rendu à résolution supersamplée
     if INCIDENTS_ENABLED:
-        inc_img = download_incidents(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, api_key)
+        inc_img = download_incidents(
+            lat, lon, zoom, render_w, render_h, api_key,
+            tile_render_size=tile_render_size
+        )
     else:
-        inc_img = Image.new("RGBA", (VIEWPORT_WIDTH, VIEWPORT_HEIGHT), (0, 0, 0, 0))
+        inc_img = Image.new("RGBA", (render_w, render_h), (0, 0, 0, 0))
         print(f"  ⚠ Incidents désactivés (INCIDENTS_ENABLED=false)")
 
-    # 4. Composer l'image finale
+    # 4. Composer l'image finale (en haute résolution)
     composite = base_img.copy()
     composite = Image.alpha_composite(composite, flow_img)
     composite = Image.alpha_composite(composite, inc_img)
 
-    # 5. Sauvegarder — captures/YYYY-MM-DD/zone_name/YYYY-MM-DD-HHMM_zone_name.jpg
+    # 5. Downscale LANCZOS → résolution finale
+    #    Le filtre LANCZOS crée un anti-aliasing naturel : les lignes sont lissées
+    #    exactement comme le ferait un rendu GPU/WebGL.
+    if SUPERSAMPLE > 1:
+        composite = composite.resize(
+            (VIEWPORT_WIDTH, VIEWPORT_HEIGHT), Image.LANCZOS
+        )
+
+    # 6. Sauvegarder en JPEG
     zone_dir = OUTPUT_DIR / date_str / zone_name
     zone_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{date_str}-{time_str}_{zone_name}.jpg"
-    out_path = zone_dir / filename
-    composite.convert("RGB").save(str(out_path), "JPEG", quality=95)
+    out_path = zone_dir / f"{date_str}-{time_str}_{zone_name}.jpg"
+    composite.convert("RGB").save(str(out_path), "JPEG", quality=OUTPUT_QUALITY)
     size_kb = out_path.stat().st_size / 1024
-    print(f"  ✅ {out_path} ({size_kb:.0f} KB)")
+    print(f"  ✅ {out_path} ({size_kb:.0f} KB) — JPEG q={OUTPUT_QUALITY}")
 
     return counter
 
@@ -1068,21 +1114,22 @@ def save_bases(api_key):
         lat, lon, zoom = parse_zone_url(zone_url)
         print(f"\n[{zone_name}] zoom={zoom}")
 
+        # Base map toujours demandée à la résolution viewport (cf. commentaire dans capture_zone)
         base_img = download_base_image(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, api_key)
         if base_img is None:
             print(f"  ✗ Échec téléchargement base")
             continue
 
-        # Cache local pour les cycles
+        # Cache local — nommé sans _ss, indépendant du supersampling
         cache_path = CACHE_DIR / f"{zone_name}_z{zoom}.png"
         base_img.save(str(cache_path), "PNG")
         print(f"  💾 Cache local: {cache_path}")
 
-        # Archivage — bases/YYYY-MM-DD/zone_name/YYYY-MM-DD-HHMM_zone_name_base.jpg
+        # Archivage — à la résolution viewport (pas besoin d'upscaler pour l'archive)
         base_dir = BASES_DIR / date_str / zone_name
         base_dir.mkdir(parents=True, exist_ok=True)
         base_path = base_dir / f"{date_str}-{time_str}_{zone_name}_base.jpg"
-        base_img.convert("RGB").save(str(base_path), "JPEG", quality=90)
+        base_img.convert("RGB").save(str(base_path), "JPEG", quality=OUTPUT_QUALITY)
         size_kb = base_path.stat().st_size / 1024
         print(f"  📁 Archivé: {base_path} ({size_kb:.0f} KB)")
 
@@ -1176,6 +1223,8 @@ def print_budget_report():
     print(f"  Marge:           {remaining} req/jour ≈ {extra_zones} zones supplémentaires")
     print(f"{'─'*65}")
 
+    if SUPERSAMPLE > 1:
+        print(f"  🔍 Supersampling ×{SUPERSAMPLE} actif — qualité améliorée, zéro surcoût API")
     if pct > 90:
         print("  ⚠ ATTENTION : consommation proche du quota !")
     elif pct > 70:
