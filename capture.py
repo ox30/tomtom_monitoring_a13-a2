@@ -1041,7 +1041,7 @@ def capture_zone(zone_name, zone_url, api_key, now):
     zone_dir.mkdir(parents=True, exist_ok=True)
     filename = f"{date_str}-{time_str}_{zone_name}.jpg"
     out_path = zone_dir / filename
-    composite.convert("RGB").save(str(out_path), "JPEG", quality=88)
+    composite.convert("RGB").save(str(out_path), "JPEG", quality=95)
     size_kb = out_path.stat().st_size / 1024
     print(f"  ✅ {out_path} ({size_kb:.0f} KB)")
 
