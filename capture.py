@@ -260,7 +260,7 @@ OUTPUT_QUALITY = 95
 # "night" → mode nuit TomTom (sombre)
 #
 # Paramètres du mode "light" — ajustez pour un fond plus/moins contrasté :
-BASE_MAP_STYLE         = os.environ.get("BASE_MAP_STYLE", "light")
+BASE_MAP_STYLE         = os.environ.get("BASE_MAP_STYLE", "night")
 LIGHT_SATURATION       = 0.05    # 0.0 = gris pur, 1.0 = couleurs originales
 LIGHT_BRIGHTNESS       = 1.1     # > 1.0 = plus clair, 1.0 = pas de changement
 LIGHT_CONTRAST         = 1.5    # < 1.0 = moins contrasté (plus doux), 1.0 = original
@@ -492,11 +492,16 @@ def get_tile_grid(lat, lon, zoom, width, height, tile_size):
 
     return tiles, origin_px, origin_py
 
+
 # ─── Décalage directionnel (tube côté droit) ─────────────────────────────────
 
 def _offset_polyline(coords, offset_px):
     """
     Décale une polyligne vers la DROITE du sens de circulation.
+     En screen coords (Y vers le bas), le perpendiculaire droit = (-uy, ux).
+    offset_px > 0 → décale à droite du sens de marche
+    offset_px < 0 → décale à gauche
+    Retourne une nouvelle liste de coordonnées décalées.
     """
     if len(coords) < 2 or abs(offset_px) < 0.5:
         return coords
