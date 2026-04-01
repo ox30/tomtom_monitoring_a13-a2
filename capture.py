@@ -926,14 +926,19 @@ def capture_zone(zone_name, zone_url, api_key, now):
         print(f"  🔍 Supersampling ×{SUPERSAMPLE} — rendu {render_w}×{render_h} → downscale {VIEWPORT_WIDTH}×{VIEWPORT_HEIGHT}")
 
     # 1. Carte de base
-    # Le nom du cache inclut SUPERSAMPLE pour invalider automatiquement
-    # si la valeur change entre deux runs.
-    cache_path = CACHE_DIR / f"{zone_name}_z{zoom}_ss{SUPERSAMPLE}.png"
+    # IMPORTANT : la base map est TOUJOURS demandée à VIEWPORT_WIDTH × VIEWPORT_HEIGHT,
+    # indépendamment du supersampling. L'API Static Image TomTom utilise des tuiles
+    # internes de 512px — sa zone géographique correspond exactement au viewport 1920×1080.
+    # Si on demandait render_w × render_h (ex. 3840×2160), l'API couvrirait 2× la zone
+    # géographique → décalage entre fond de carte et couches vectorielles.
+    # On upscale ensuite en RAM (LANCZOS) avant de composer avec flow et incidents.
+    # Le cache est nommé sans _ss car il est indépendant du supersampling.
+    cache_path = CACHE_DIR / f"{zone_name}_z{zoom}.png"
     if cache_path.exists():
         print(f"  📦 Base map: cache OK")
         base_img = Image.open(cache_path).convert("RGBA")
     else:
-        base_img = download_base_image(lat, lon, zoom, render_w, render_h, api_key)
+        base_img = download_base_image(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, api_key)
         if base_img is None:
             print(f"  ✗ Impossible de télécharger la carte de base")
             return 0
@@ -941,8 +946,8 @@ def capture_zone(zone_name, zone_url, api_key, now):
         base_img.save(str(cache_path), "PNG")
         print(f"  💾 Base map cachée localement")
 
-    # S'assurer que la base est bien à la résolution de rendu
-    if base_img.size != (render_w, render_h):
+    # Upscaler la base à la résolution de rendu pour la composition
+    if SUPERSAMPLE > 1:
         base_img = base_img.resize((render_w, render_h), Image.LANCZOS)
 
     # 2. Traffic Flow — rendu à résolution supersamplée
@@ -999,32 +1004,26 @@ def save_bases(api_key):
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    render_w = VIEWPORT_WIDTH  * SUPERSAMPLE
-    render_h = VIEWPORT_HEIGHT * SUPERSAMPLE
-
     for zone_name, zone_url in ZONES.items():
         lat, lon, zoom = parse_zone_url(zone_url)
         print(f"\n[{zone_name}] zoom={zoom}")
 
-        base_img = download_base_image(lat, lon, zoom, render_w, render_h, api_key)
+        # Base map toujours demandée à la résolution viewport (cf. commentaire dans capture_zone)
+        base_img = download_base_image(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, api_key)
         if base_img is None:
             print(f"  ✗ Échec téléchargement base")
             continue
 
-        # Cache local — nom incluant SUPERSAMPLE
-        cache_path = CACHE_DIR / f"{zone_name}_z{zoom}_ss{SUPERSAMPLE}.png"
+        # Cache local — nommé sans _ss, indépendant du supersampling
+        cache_path = CACHE_DIR / f"{zone_name}_z{zoom}.png"
         base_img.save(str(cache_path), "PNG")
         print(f"  💾 Cache local: {cache_path}")
 
-        # Archivage — downscalé à la résolution finale pour économiser l'espace
+        # Archivage — à la résolution viewport (pas besoin d'upscaler pour l'archive)
         base_dir = BASES_DIR / date_str / zone_name
         base_dir.mkdir(parents=True, exist_ok=True)
         base_path = base_dir / f"{date_str}-{time_str}_{zone_name}_base.jpg"
-        if SUPERSAMPLE > 1:
-            base_out = base_img.resize((VIEWPORT_WIDTH, VIEWPORT_HEIGHT), Image.LANCZOS)
-        else:
-            base_out = base_img
-        base_out.convert("RGB").save(str(base_path), "JPEG", quality=OUTPUT_QUALITY)
+        base_img.convert("RGB").save(str(base_path), "JPEG", quality=OUTPUT_QUALITY)
         size_kb = base_path.stat().st_size / 1024
         print(f"  📁 Archivé: {base_path} ({size_kb:.0f} KB)")
 
