@@ -226,10 +226,11 @@ def parse_mvt_tile(data):
 
 # Zones — coller directement l'URL de plan.tomtom.com
 ZONES = {
-    "zone_globale_A2_A13":     "https://plan.tomtom.com/en/?p=46.68973,8.93561,8.55z",
-    "zone_Monitoring_2026":    "https://plan.tomtom.com/en/?p=46.87061,9.35258,10.09z",
-    "zone_Chur_Isla-T":        "https://plan.tomtom.com/en/?p=46.84086,9.45618,12.17z",
-    "zone_GST":                "https://plan.tomtom.com/en/?p=46.6353,8.68195,10.3z",
+    "zone_globale_A2_A13":     "https://plan.tomtom.com/en/?p=46.77047,8.61182,8z",
+    "zone_Monitoring_2026":    "https://plan.tomtom.com/en/?p=46.89357,9.49312,10z",
+    "zone_Sargans-Landquart":  "https://plan.tomtom.com/en/?p=47.0149,9.50575,12z",
+    "zone_Landquart-Chur":     "https://plan.tomtom.com/en/?p=46.92375,9.52431,12z",
+    "zone_Chur_Isla-T":        "https://plan.tomtom.com/en/?p=46.82883,9.47714,12z",
 }
 
 VIEWPORT_WIDTH  = 1920
