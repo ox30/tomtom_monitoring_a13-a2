@@ -269,7 +269,7 @@ LIGHT_CONTRAST         = 1.5    # < 1.0 = moins contrasté (plus doux), 1.0 = or
 # Filtrage des types de route par niveau de zoom
 # Plus le zoom est faible (vue large), moins on affiche de routes
 ROAD_TYPES_BY_ZOOM = {
-    8:  [0],            # Motorway uniquement
+    8:  [0,1],            # Motorway uniquement
     9:  [0, 1],         # + International
     10: [0, 1, 2],      # + Major
     11: [0, 1, 2, 3],   # + Secondary
