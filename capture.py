@@ -3,23 +3,14 @@ TomTom Traffic Capture — Vector Flow Edition
 =============================================
 Capture automatique du trafic via l'API TomTom, orchestrée par GitHub Actions.
 
-Architecture (3 couches superposées) :
-  1. Carte de base   → API Static Image (une seule requête HTTP, pas de navigateur)
-  2. Traffic Flow     → Vector Flow Tiles (.pbf) — filtrage par type de route,
-                        rendu Pillow avec la charte visuelle relative0 de plan.tomtom.com
-  3. Incidents        → Vector Incident Tiles (.pbf) — 3 styles visuels :
-                        • hatched_red  = tube losanges rouge/blanc (fermetures)
-                        • hatched_grey = tube losanges gris/blanc (travaux, météo)
-                        • solid        = tube plein couleur par magnitude (bouchons)
+Architecture (3 couches superposées + annotations) :
+  1. Carte de base   → API Static Image (une seule requête HTTP)
+  2. Traffic Flow     → Vector Flow Tiles (.pbf)
+  3. Incidents        → Vector Incident Tiles (.pbf)
+  4. Annotations      → Badges de délai sur les incidents (optionnel, par zone)
 
-Avantages vs versions précédentes :
-  - Filtrage par catégorie de route (motorway, international, major…)
-  - Épaisseur de ligne proportionnelle au type de route
-  - Contour sombre autour de chaque segment (comme plan.tomtom.com)
-  - Incidents vectoriels avec charte graphique configurable
-  - Plus d'appel à l'API Incident Details v5 (tout via tuiles, quota 50k/jour)
-
-Dépendances : requests, Pillow (parseur protobuf intégré)
+Configuration : voir config.py (même dossier)
+Dépendances  : requests, Pillow (parseur protobuf intégré)
 """
 
 import os
@@ -30,13 +21,13 @@ import struct
 import requests
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
 from io import BytesIO
-from PIL import Image, ImageDraw, ImageEnhance
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont
+
+# ─── Import configuration ────────────────────────────────────────────────────
+from config import *
 
 # ─── Protobuf minimal parser ─────────────────────────────────────────────────
-# Parseur protobuf léger intégré — pas de dépendance externe requise.
-# Supporte le format Mapbox Vector Tile (MVT) utilisé par TomTom.
 
 def _decode_varint(data, pos):
     """Décode un varint protobuf."""
@@ -66,16 +57,16 @@ def _parse_protobuf(data):
         field_num = tag >> 3
         wire_type = tag & 0x07
 
-        if wire_type == 0:  # Varint
+        if wire_type == 0:
             val, pos = _decode_varint(data, pos)
-        elif wire_type == 1:  # 64-bit
+        elif wire_type == 1:
             val = struct.unpack('<d', data[pos:pos+8])[0]
             pos += 8
-        elif wire_type == 2:  # Length-delimited
+        elif wire_type == 2:
             length, pos = _decode_varint(data, pos)
             val = data[pos:pos+length]
             pos += length
-        elif wire_type == 5:  # 32-bit
+        elif wire_type == 5:
             val = struct.unpack('<f', data[pos:pos+4])[0]
             pos += 4
         else:
@@ -137,43 +128,29 @@ def _decode_geometry(geom_data):
 
 
 def parse_mvt_tile(data):
-    """
-    Parse une tuile MVT et retourne les features du layer 'Traffic flow'.
-
-    Retourne: liste de dicts avec 'geometry' (lignes), 'tags' (dict de propriétés)
-    """
+    """Parse une tuile MVT — retourne les features du layer 'Traffic flow'."""
     if not data or len(data) < 2:
         return []
 
     tile = _parse_protobuf(data)
     features_out = []
 
-    # Field 3 = layers dans Tile
     for layer_data in tile.get(3, []):
         layer = _parse_protobuf(layer_data)
-
-        # Field 1 = name
         name = layer.get(1, [b''])[0]
         if isinstance(name, bytes):
             name = name.decode('utf-8', errors='ignore')
-
-        # On ne traite que le layer "Traffic flow"
         if name != "Traffic flow":
             continue
 
-        # Field 5 = extent (défaut 4096)
         extent = layer.get(5, [4096])[0]
-
-        # Field 3 = keys (array de strings)
         keys = []
         for k in layer.get(3, []):
             keys.append(k.decode('utf-8', errors='ignore') if isinstance(k, bytes) else str(k))
 
-        # Field 4 = values (array de TileValue)
         values = []
         for v_data in layer.get(4, []):
             v_fields = _parse_protobuf(v_data)
-            # TileValue: 1=string, 2=float, 3=double, 4=int64, 5=uint64, 6=sint64, 7=bool
             if 1 in v_fields:
                 val = v_fields[1][0]
                 values.append(val.decode('utf-8', errors='ignore') if isinstance(val, bytes) else str(val))
@@ -192,11 +169,8 @@ def parse_mvt_tile(data):
             else:
                 values.append(None)
 
-        # Field 2 = features
         for feat_data in layer.get(2, []):
             feat = _parse_protobuf(feat_data)
-
-            # Field 2 = tags (packed uint32)
             tags_raw = _decode_packed_uint32(feat.get(2, [b''])[0]) if 2 in feat and isinstance(feat[2][0], bytes) else []
             props = {}
             for j in range(0, len(tags_raw) - 1, 2):
@@ -205,7 +179,6 @@ def parse_mvt_tile(data):
                 if k_idx < len(keys) and v_idx < len(values):
                     props[keys[k_idx]] = values[v_idx]
 
-            # Field 4 = geometry (packed uint32)
             geom_raw = feat.get(4, [b''])[0]
             if isinstance(geom_raw, bytes) and len(geom_raw) > 0:
                 geometry = _decode_geometry(geom_raw)
@@ -222,92 +195,75 @@ def parse_mvt_tile(data):
     return features_out
 
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+def parse_mvt_tile_incidents(data):
+    """Parse une tuile MVT — retourne les features du layer 'Traffic incident flow'."""
+    if not data or len(data) < 2:
+        return []
 
-# Zones — coller directement l'URL de plan.tomtom.com
-ZONES = {
-    "zone_globale_A2_A13":     "https://plan.tomtom.com/en/?p=46.77047,8.61182,8z",
-    "zone_Monitoring_2026":    "https://plan.tomtom.com/en/?p=46.89357,9.49312,10z",
-    "zone_Sargans-Landquart":  "https://plan.tomtom.com/en/?p=47.0149,9.50575,12z",
-    "zone_Landquart-Chur":     "https://plan.tomtom.com/en/?p=46.92375,9.52431,12z",
-    "zone_Chur_Isla-T":        "https://plan.tomtom.com/en/?p=46.82883,9.47714,12z",
-}
+    tile = _parse_protobuf(data)
+    features_out = []
 
-VIEWPORT_WIDTH  = 1920
-VIEWPORT_HEIGHT = 1080
-TILE_SIZE       = 512       # Taille des tuiles vectorielles (en pixels de rendu)
-RETENTION_DAYS  = 7
-OUTPUT_DIR      = Path("captures")    # Captures toutes les 10 min
-BASES_DIR       = Path("bases")       # Cartes de base 1× par run
-CACHE_DIR       = Path(".base-cache") # Cache local (pas commité)
-TIMEZONE        = ZoneInfo("Europe/Zurich")
+    for layer_data in tile.get(3, []):
+        layer = _parse_protobuf(layer_data)
+        name = layer.get(1, [b''])[0]
+        if isinstance(name, bytes):
+            name = name.decode('utf-8', errors='ignore')
+        if name != "Traffic incident flow":
+            continue
 
-# ─── Supersampling ────────────────────────────────────────────────────────────
-# Rendu interne à N× la résolution finale, puis downscale LANCZOS.
-# Produit des lignes anti-aliasées (lissées) sans aucun surcoût API.
-# 1 = désactivé (comportement original)
-# 2 = bon compromis qualité/RAM (~600 MB pic en RAM)
-# 3 = meilleur rendu mais RAM ~3× plus élevée
-SUPERSAMPLE = 2
+        extent = layer.get(5, [4096])[0]
+        keys = []
+        for k in layer.get(3, []):
+            keys.append(k.decode('utf-8', errors='ignore') if isinstance(k, bytes) else str(k))
 
-# ─── Format de sortie ────────────────────────────────────────────────────────
-# Qualité JPEG — relevée de 88 à 95 pour réduire les artefacts de compression
-# autour des traits de flow et d'incidents.
-OUTPUT_QUALITY = 95
+        values = []
+        for v_data in layer.get(4, []):
+            v_fields = _parse_protobuf(v_data)
+            if 1 in v_fields:
+                val = v_fields[1][0]
+                values.append(val.decode('utf-8', errors='ignore') if isinstance(val, bytes) else str(val))
+            elif 2 in v_fields:
+                values.append(v_fields[2][0])
+            elif 3 in v_fields:
+                values.append(v_fields[3][0])
+            elif 4 in v_fields:
+                values.append(v_fields[4][0])
+            elif 5 in v_fields:
+                values.append(v_fields[5][0])
+            elif 6 in v_fields:
+                values.append(_decode_zigzag(v_fields[6][0]))
+            elif 7 in v_fields:
+                values.append(bool(v_fields[7][0]))
+            else:
+                values.append(None)
 
-# Style de la carte de base — configurable via env BASE_MAP_STYLE au lancement
-# "main"  → couleurs standard TomTom (défaut API)
-# "light" → fond gris clair désaturé (comme plan.tomtom.com mode Light)
-# "night" → mode nuit TomTom (sombre)
-#
-# Paramètres du mode "light" — ajustez pour un fond plus/moins contrasté :
-BASE_MAP_STYLE         = os.environ.get("BASE_MAP_STYLE", "night")
-LIGHT_SATURATION       = 0.05    # 0.0 = gris pur, 1.0 = couleurs originales
-LIGHT_BRIGHTNESS       = 1.1     # > 1.0 = plus clair, 1.0 = pas de changement
-LIGHT_CONTRAST         = 1.5    # < 1.0 = moins contrasté (plus doux), 1.0 = original
+        for feat_data in layer.get(2, []):
+            feat = _parse_protobuf(feat_data)
+            tags_raw = _decode_packed_uint32(feat.get(2, [b''])[0]) if 2 in feat and isinstance(feat[2][0], bytes) else []
+            props = {}
+            for j in range(0, len(tags_raw) - 1, 2):
+                k_idx = tags_raw[j]
+                v_idx = tags_raw[j + 1]
+                if k_idx < len(keys) and v_idx < len(values):
+                    props[keys[k_idx]] = values[v_idx]
 
-# Filtrage des types de route par niveau de zoom
-# Plus le zoom est faible (vue large), moins on affiche de routes
-ROAD_TYPES_BY_ZOOM = {
-    8:  [0,1],            # Motorway uniquement
-    9:  [0, 1],         # + International
-    10: [0, 1, 2],      # + Major
-    11: [0, 1, 2, 3],   # + Secondary
-    12: [0, 1, 2, 3],   # + Secondary
-    13: [0, 1, 2, 3, 4],
-    14: [0, 1, 2, 3, 4, 5],
-    15: [0, 1, 2, 3, 4, 5, 6],
-}
+            geom_raw = feat.get(4, [b''])[0]
+            if isinstance(geom_raw, bytes) and len(geom_raw) > 0:
+                geometry = _decode_geometry(geom_raw)
+            else:
+                geometry = []
 
-# Épaisseur des lignes par type de route (outline, main)
-# Reproduit la hiérarchie visuelle de plan.tomtom.com
-LINE_WIDTH = {
-    "Motorway":         (9, 7),
-    "International road": (7, 7),
-    "Major road":       (7, 6),
-    "Secondary road":   (6, 6),
-    "Connecting road":  (6, 5),
-    "Major local road": (5, 5),
-    "Local road":       (5, 4),
-    "Minor local road": (4, 4),
-    "Non public road":  (3, 4),
-    "Parking road":     (3, 3),
-}
-DEFAULT_WIDTH = (7, 6)
+            if geometry:
+                features_out.append({
+                    'geometry': geometry,
+                    'tags': props,
+                    'extent': extent,
+                })
 
-# ─── Charte visuelle TomTom relative0 adaptée ────────────────────────────────────────
-# Couleurs adapté extraites de la documentation officielle TomTom
-# https://developer.tomtom.com/traffic-api/documentation/traffic-flow/raster-flow-tiles
+    return features_out
 
-# (outline_color, main_color) — RGBA
-TRAFFIC_COLORS = {
-    "closed":       ((0, 0, 0, 150),       (124, 121, 121, 150)),  # Route fermée
-    "very_slow":    ((135, 8, 12, 255),     (172, 12, 17, 255)),      # < 15% free-flow
-    "slow":         ((210, 124, 16, 255),   (243, 142, 17, 255)),   # 15-35%
-    "moderate":     ((218, 195, 17, 255),  (247, 222, 34, 255)),   # 35-75%
-    "free":         ((117, 223, 31, 255),    (116, 245, 12, 255)),    # ≥ 75%
-}
 
+# ─── Traffic category ─────────────────────────────────────────────────────────
 
 def get_traffic_category(tags):
     """Détermine la catégorie de trafic à partir des tags du segment."""
@@ -328,117 +284,6 @@ def get_traffic_category(tags):
     else:
         return "free"
 
-
-# ─── Charte incidents TomTom plan ─────────────────────────────────────────────
-# Chaque icon_category est affectée à un style visuel et une priorité de dessin.
-# Priorité : plus le chiffre est élevé, plus l'élément est dessiné PAR-DESSUS.
-# Modifiez ces dictionnaires pour ajuster l'apparence.
-#
-# Styles disponibles :
-#   "hatched_red"  → Tube losanges rouge/blanc (fermetures)
-#   "hatched_grey" → Tube losanges gris/blanc (travaux, météo…)
-#   "solid"        → Tube plein, couleur selon magnitude (bouchons…)
-#   None           → Ne pas afficher cette catégorie
-#
-# icon_category :
-#   0  = Unknown
-#   1  = Accident
-#   2  = Fog (brouillard)
-#   3  = Dangerous Conditions
-#   4  = Rain (pluie)
-#   5  = Ice (verglas)
-#   6  = Jam (bouchon)
-#   7  = Lane Closed (voie fermée)
-#   8  = Road Closed (route fermée)
-#   9  = Road Works (travaux)
-#   10 = Wind (vent)
-#   11 = Flooding (inondation)
-#   13 = Cluster (mix)
-#   14 = Broken Down Vehicle (véhicule en panne)
-
-INCIDENT_STYLE = {
-    0:  "hatched_grey",   # Unknown
-    1:  "hatched_grey",   # Accident
-    2:  "hatched_grey",   # Fog
-    3:  "hatched_grey",   # Dangerous Conditions
-    4:  "hatched_grey",   # Rain
-    5:  "hatched_grey",   # Ice
-    6:  "solid",          # Jam
-    7:  "hatched_grey",   # Lane Closed
-    8:  "hatched_red",    # Road Closed
-    9:  "hatched_grey",   # Road Works
-    10: "hatched_grey",   # Wind
-    11: "hatched_grey",   # Flooding
-    13: "hatched_grey",   # Cluster
-    14: "hatched_grey",   # Broken Down Vehicle
-}
-
-# Priorité de dessin — plus le chiffre est élevé, plus c'est dessiné par-dessus.
-# Ajustez pour changer l'ordre de superposition.
-INCIDENT_PRIORITY = {
-    0:  10,     # Unknown
-    1:  50,     # Accident
-    2:  20,     # Fog
-    3:  20,     # Dangerous Conditions
-    4:  20,     # Rain
-    5:  25,     # Ice
-    6:  60,     # Jam — par-dessus les hachurés
-    7:  55,     # Lane Closed
-    8:  100,    # Road Closed — priorité maximale
-    9:  30,     # Road Works
-    10: 20,     # Wind
-    11: 25,     # Flooding
-    13: 40,     # Cluster
-    14: 45,     # Broken Down Vehicle
-}
-
-# Couleurs des tubes pleins (solid) par magnitude
-# magnitude: (outline_color, main_color) — RGBA
-INCIDENT_MAGNITUDE_COLORS = {
-    0: ((140, 60, 60, 255),  (200, 100, 100, 255)),   # Unknown — rouge clair
-    1: ((170, 60, 20, 255),  (220, 120, 60, 255)),    # Minor — orange
-    2: ((160, 20, 10, 255),  (210, 50, 30, 255)),     # Moderate — rouge moyen
-    3: ((120, 5, 5, 255),    (170, 10, 10, 255)),     # Major — rouge foncé
-    4: ((100, 10, 10, 255),  (150, 15, 15, 255)),     # Indefinite — rouge très foncé
-}
-
-# Couleurs des tubes hachurés — (outline/squares color, grey fill color)
-# Motif : contour fin coloré, fond gris clair, carrés colorés pleine hauteur
-# Ratio : 1/3 carré coloré + 2/3 rectangle gris
-HATCHED_RED_COLORS  = ((190, 30, 30, 255), (216, 216, 216, 255))   # rouge + gris clair
-HATCHED_GREY_COLORS = ((122, 128, 144, 255), (224, 224, 224, 255)) # gris-bleu + gris très clair
-
-# Épaisseur des incidents par type de route (légèrement plus épais que le flow)
-INCIDENT_WIDTH = {
-    "Motorway":           (9, 8),
-    "International road": (8, 8),
-    "Major road":         (8, 7),
-    "Secondary road":     (7, 7),
-    "Connecting road":    (7, 6),
-    "Major local road":   (6, 6),
-    "Local road":         (6, 5),
-    "Minor local road":   (5, 5),
-}
-INCIDENT_DEFAULT_WIDTH = (8, 7)
-
-# ─── Décalage directionnel (tube côté droit du sens de circulation) ───────────
-# Chaque tube est décalé vers la droite et affiné pour séparer les deux sens.
-# Multiplicateurs appliqués à l'épaisseur d'origine (outline_w / main_w).
-#
-# offset  = distance du centre de la route (plus grand → plus écarté)
-# outline = épaisseur de la bordure visible
-# main    = épaisseur de la couleur visible
-
-FLOW_OFFSET     = 0.5     # Décalage flow (× outline_w)
-FLOW_VIS_OUTLINE = 0.55   # Bordure visible flow (× outline_w)
-FLOW_VIS_MAIN    = 0.5    # Couleur visible flow (× main_w)
-
-INCIDENT_OFFSET      = 0.35   # Décalage incidents (× outline_w) — moins que flow → dépasse
-INCIDENT_VIS_OUTLINE = 0.65   # Bordure visible incidents (× outline_w)
-INCIDENT_VIS_MAIN    = 0.6    # Couleur visible incidents (× main_w)
-
-# Activation des incidents — peut être désactivé via env INCIDENTS_ENABLED=false
-INCIDENTS_ENABLED = os.environ.get("INCIDENTS_ENABLED", "true").lower() != "false"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -463,22 +308,13 @@ def lat_lon_to_tile(lat, lon, zoom):
 
 
 def get_tile_grid(lat, lon, zoom, width, height, tile_size):
-    """
-    Calcule la grille de tuiles nécessaire pour couvrir le viewport.
-    Retourne (tiles_info, origin_offset_x, origin_offset_y).
-    tiles_info = [(tile_x, tile_y, pixel_offset_x, pixel_offset_y), ...]
-    """
+    """Calcule la grille de tuiles nécessaire pour couvrir le viewport."""
     center_tx, center_ty = lat_lon_to_tile(lat, lon, zoom)
-
-    # Pixel du centre dans l'espace global des tuiles
     center_px = center_tx * tile_size
     center_py = center_ty * tile_size
-
-    # Coin supérieur gauche du viewport en pixels globaux
     origin_px = center_px - width / 2
     origin_py = center_py - height / 2
 
-    # Range de tuiles
     tile_x_min = int(math.floor(origin_px / tile_size))
     tile_x_max = int(math.floor((origin_px + width - 1) / tile_size))
     tile_y_min = int(math.floor(origin_py / tile_size))
@@ -494,16 +330,10 @@ def get_tile_grid(lat, lon, zoom, width, height, tile_size):
     return tiles, origin_px, origin_py
 
 
-# ─── Décalage directionnel (tube côté droit) ─────────────────────────────────
+# ─── Décalage directionnel ────────────────────────────────────────────────────
 
 def _offset_polyline(coords, offset_px):
-    """
-    Décale une polyligne vers la DROITE du sens de circulation.
-     En screen coords (Y vers le bas), le perpendiculaire droit = (-uy, ux).
-    offset_px > 0 → décale à droite du sens de marche
-    offset_px < 0 → décale à gauche
-    Retourne une nouvelle liste de coordonnées décalées.
-    """
+    """Décale une polyligne vers la DROITE du sens de circulation."""
     if len(coords) < 2 or abs(offset_px) < 0.5:
         return coords
 
@@ -511,17 +341,13 @@ def _offset_polyline(coords, offset_px):
     n = len(coords)
 
     for i in range(n):
-        # Calculer la direction moyenne au point i
         if i == 0:
-            # Premier point : direction du premier segment
             dx = coords[1][0] - coords[0][0]
             dy = coords[1][1] - coords[0][1]
         elif i == n - 1:
-            # Dernier point : direction du dernier segment
             dx = coords[n-1][0] - coords[n-2][0]
             dy = coords[n-1][1] - coords[n-2][1]
         else:
-            # Point intermédiaire : moyenne des deux segments adjacents
             dx = coords[i+1][0] - coords[i-1][0]
             dy = coords[i+1][1] - coords[i-1][1]
 
@@ -530,15 +356,11 @@ def _offset_polyline(coords, offset_px):
             result.append(coords[i])
             continue
 
-        # Normaliser
         ux = dx / length
         uy = dy / length
-
-        # Perpendiculaire droite en screen coords (Y vers le bas)
         nx = -uy
         ny = ux
 
-        # Décaler le point
         new_x = coords[i][0] + nx * offset_px
         new_y = coords[i][1] + ny * offset_px
         result.append((int(round(new_x)), int(round(new_y))))
@@ -548,7 +370,7 @@ def _offset_polyline(coords, offset_px):
 
 # ─── API calls ────────────────────────────────────────────────────────────────
 
-counter = 0  # Compteur de requêtes API
+counter = 0
 
 
 def api_get(url, binary=False):
@@ -563,42 +385,21 @@ def api_get(url, binary=False):
 
 
 def _apply_light_style(img):
-    """
-    Transforme une image carte en version "Light" (fond gris clair désaturé).
-    """
-  
-    # Travailler en RGB pour les transformations
+    """Transforme une image carte en version 'Light' (fond gris clair désaturé)."""
     rgb = img.convert("RGB")
-
-    # 1. Désaturer (retirer les couleurs)
     enhancer = ImageEnhance.Color(rgb)
     rgb = enhancer.enhance(LIGHT_SATURATION)
-
-    # 2. Éclaircir
     enhancer = ImageEnhance.Brightness(rgb)
     rgb = enhancer.enhance(LIGHT_BRIGHTNESS)
-
-    # 3. Réduire le contraste (adoucir)
     enhancer = ImageEnhance.Contrast(rgb)
     rgb = enhancer.enhance(LIGHT_CONTRAST)
-
-    # Reconvertir en RGBA
     return rgb.convert("RGBA")
 
 
 def download_base_image(lat, lon, zoom, width, height, api_key):
-    """
-    Télécharge la carte de base via l'API Static Image de TomTom.
-    Applique le style configuré (main, light, night).
-    width/height sont les dimensions de rendu (peuvent être supersamplées).
-    L'API est limitée à 8192×8192 — on clamp et on redimensionne si nécessaire.
-    """
-
-    # Limiter à 8192x8192 (max API)
+    """Télécharge la carte de base via l'API Static Image de TomTom."""
     w = min(width, 8192)
     h = min(height, 8192)
-
-    # Style API : "main" ou "night" (pas de "light" côté API)
     api_style = "night" if BASE_MAP_STYLE == "night" else "main"
 
     url = (
@@ -615,10 +416,8 @@ def download_base_image(lat, lon, zoom, width, height, api_key):
     data = api_get(url, binary=True)
     if data:
         img = Image.open(BytesIO(data)).convert("RGBA")
-        # Redimensionner si nécessaire
         if img.size != (width, height):
             img = img.resize((width, height), Image.LANCZOS)
-        # Appliquer le style "light" (désaturation + éclaircissement)
         if BASE_MAP_STYLE == "light":
             img = _apply_light_style(img)
         return img
@@ -626,14 +425,7 @@ def download_base_image(lat, lon, zoom, width, height, api_key):
 
 
 def download_vector_flow(lat, lon, zoom, width, height, api_key, tile_render_size=None):
-    """
-    Télécharge les tuiles vectorielles de trafic flow (.pbf) et les dessine.
-
-    tile_render_size : taille de rendu d'une tuile en pixels (défaut = TILE_SIZE).
-                       En mode supersampling, passer TILE_SIZE * SUPERSAMPLE.
-                       Les requêtes API restent identiques (zoom/x/y inchangés).
-    """
-    # Déterminer les types de route à afficher pour ce zoom
+    """Télécharge et dessine les tuiles vectorielles de trafic flow (.pbf)."""
     if tile_render_size is None:
         tile_render_size = TILE_SIZE
 
@@ -644,7 +436,6 @@ def download_vector_flow(lat, lon, zoom, width, height, api_key, tile_render_siz
         lat, lon, zoom, width, height, tile_render_size
     )
 
-    # Image transparente pour le flow
     flow_img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(flow_img)
 
@@ -653,11 +444,9 @@ def download_vector_flow(lat, lon, zoom, width, height, api_key, tile_render_siz
     n_downloaded = 0
 
     for tile_x, tile_y, px_off, py_off in tiles:
-        # Clamp tile coords
         max_tile = 2 ** zoom - 1
         if tile_y < 0 or tile_y > max_tile:
             continue
-
         tx = tile_x % (max_tile + 1)
 
         url = (
@@ -675,7 +464,6 @@ def download_vector_flow(lat, lon, zoom, width, height, api_key, tile_render_siz
 
         features = parse_mvt_tile(data)
 
-        # Trier : dessiner les routes fluides d'abord, congestionnées par-dessus
         def sort_key(f):
             cat = get_traffic_category(f['tags'])
             order = {"free": 0, "moderate": 1, "slow": 2, "very_slow": 3, "closed": 4}
@@ -688,8 +476,6 @@ def download_vector_flow(lat, lon, zoom, width, height, api_key, tile_render_siz
             extent = feat.get('extent', 4096)
             category = get_traffic_category(tags)
             outline_color, main_color = TRAFFIC_COLORS[category]
-
-            # Épaisseur selon le type de route
             road_type = tags.get('road_type', '')
             outline_w, main_w = LINE_WIDTH.get(road_type, DEFAULT_WIDTH)
 
@@ -697,39 +483,26 @@ def download_vector_flow(lat, lon, zoom, width, height, api_key, tile_render_siz
                 if len(line) < 2:
                     continue
 
-                # Convertir coords tuile (0-extent) en pixels viewport
                 pixel_line = []
                 for tx_coord, ty_coord in line:
                     px = px_off + (tx_coord / extent) * tile_render_size
                     py = py_off + (ty_coord / extent) * tile_render_size
                     pixel_line.append((px, py))
 
-                # Simplifier : ignorer les segments hors viewport (avec marge)
                 margin = 50
-                all_outside = all(
-                    x < -margin or x > width + margin or y < -margin or y > height + margin
-                    for x, y in pixel_line
-                )
-                if all_outside:
+                if all(x < -margin or x > width + margin or y < -margin or y > height + margin
+                       for x, y in pixel_line):
                     continue
 
                 n_features += 1
-
-                # Coordonnées pixel
                 coords = [(int(round(x)), int(round(y))) for x, y in pixel_line]
 
                 if len(coords) >= 2:
-                    # Décaler le tube vers la droite du sens de circulation
                     offset_px = max(1, outline_w * FLOW_OFFSET)
                     shifted = _offset_polyline(coords, offset_px)
-
-                    # Largeurs visibles
                     vis_outline = max(1, int(math.ceil(outline_w * FLOW_VIS_OUTLINE)))
                     vis_main = max(1, int(math.ceil(main_w * FLOW_VIS_MAIN)))
-
-                    # Outline (bordure sombre)
                     draw.line(shifted, fill=outline_color, width=vis_outline, joint="curve")
-                    # Main (couleur vive)
                     draw.line(shifted, fill=main_color, width=vis_main, joint="curve")
 
     print(f"  🚗 Flow: {n_downloaded}/{n_tiles} tuiles, {n_features} segments"
@@ -737,15 +510,14 @@ def download_vector_flow(lat, lon, zoom, width, height, api_key, tile_render_siz
     return flow_img
 
 
-def download_incidents(lat, lon, zoom, width, height, api_key, tile_render_size=None):
+def download_incidents(lat, lon, zoom, width, height, api_key,
+                       tile_render_size=None, collect_annotations=False):
     """
     Télécharge les incidents via Vector Incident Tiles (.pbf) et les dessine.
-    trie par priorité (INCIDENT_PRIORITY), puis dessine :
-      - hatched_red  : tube losanges rouge/blanc (fermetures)
-      - hatched_grey : tube losanges gris/blanc (travaux, météo)
-      - solid        : tube plein couleur par magnitude (bouchons)
 
-    tile_render_size : même principe que pour download_vector_flow.
+    Si collect_annotations=True, retourne (image, annotations_list) où
+    annotations_list contient les données nécessaires pour dessiner les badges.
+    Sinon, retourne (image, []).
     """
     if tile_render_size is None:
         tile_render_size = TILE_SIZE
@@ -773,7 +545,7 @@ def download_incidents(lat, lon, zoom, width, height, api_key, tile_render_size=
             f"https://api.tomtom.com/traffic/map/4/tile/incidents"
             f"/{zoom}/{tx}/{tile_y}.pbf"
             f"?key={api_key}"
-            f"&tags=[icon_category,magnitude,road_type,delay]"
+            f"&tags=[icon_category,magnitude,road_type,delay,id]"
         )
 
         data = api_get(url, binary=True)
@@ -787,7 +559,6 @@ def download_incidents(lat, lon, zoom, width, height, api_key, tile_render_size=
             tags = feat['tags']
             extent = feat.get('extent', 4096)
 
-            # Déterminer l'icon_category
             icon_cat = None
             for key, val in tags.items():
                 if key == 'icon_category' or key.startswith('icon_category_'):
@@ -816,6 +587,18 @@ def download_incidents(lat, lon, zoom, width, height, api_key, tile_render_size=
                 except (ValueError, TypeError):
                     magnitude = 0
 
+            # Récupérer le delay (en secondes)
+            delay = 0
+            if 'delay' in tags:
+                try:
+                    delay = int(float(tags['delay']))
+                except (ValueError, TypeError):
+                    delay = 0
+
+            # Récupérer l'identifiant unique de l'incident
+            # Permet de dédupliquer les segments du même incident sur plusieurs tuiles
+            incident_id = tags.get('id', None)
+
             for line in feat['geometry']:
                 if len(line) < 2:
                     continue
@@ -837,23 +620,21 @@ def download_incidents(lat, lon, zoom, width, height, api_key, tile_render_size=
                     continue
 
                 all_incidents.append((priority, style, icon_cat, magnitude,
-                                      outline_w, main_w, coords))
+                                      outline_w, main_w, coords, delay, incident_id))
 
-    # Phase 2 : Trier par priorité (basse d'abord → haute dessinée par-dessus)
+    # Phase 2 : Trier par priorité
     all_incidents.sort(key=lambda x: x[0])
 
-    # Phase 3 : Dessiner dans l'ordre, décalé à droite du sens de circulation
-    # Les incidents sont légèrement moins décalés que le flow → ils "dépassent"
+    # Phase 3 : Dessiner + collecter les annotations
     n_hatched_red = 0
     n_hatched_grey = 0
     n_solid = 0
+    annotations = []
+    annotated_ids = set()  # IDs d'incidents déjà annotés (évite les doublons)
 
-    for priority, style, icon_cat, magnitude, outline_w, main_w, coords in all_incidents:
-        # Décalage directionnel
+    for priority, style, icon_cat, magnitude, outline_w, main_w, coords, delay, incident_id in all_incidents:
         offset_px = max(1, outline_w * INCIDENT_OFFSET)
         shifted = _offset_polyline(coords, offset_px)
-
-        # Largeurs visibles
         vis_outline = max(1, int(math.ceil(outline_w * INCIDENT_VIS_OUTLINE)))
         vis_main = max(1, int(math.ceil(main_w * INCIDENT_VIS_MAIN)))
 
@@ -871,37 +652,101 @@ def download_incidents(lat, lon, zoom, width, height, api_key, tile_render_size=
             draw.line(shifted, fill=main_c, width=vis_main, joint="curve")
             n_solid += 1
 
+        # Collecter les données d'annotation si activé
+        if collect_annotations and INCIDENT_ANNOTATIONS.get(icon_cat, False):
+            if delay >= ANNOTATION_MIN_DELAY_SEC:
+                # Dédupliquer : un seul badge par incident unique
+                # (un même incident peut avoir plusieurs segments sur différentes tuiles)
+                if incident_id is not None and incident_id in annotated_ids:
+                    continue  # Ce segment appartient à un incident déjà annoté
+                if incident_id is not None:
+                    annotated_ids.add(incident_id)
+
+                # Point d'ancrage = DÉBUT de la polyligne (arrière du bouchon)
+                anchor_x, anchor_y = shifted[0][0], shifted[0][1]
+
+                # Direction du trafic au point d'ancrage
+                if len(shifted) >= 2:
+                    dx = shifted[1][0] - shifted[0][0]
+                    dy = shifted[1][1] - shifted[0][1]
+                    d_len = math.hypot(dx, dy)
+                    if d_len > 0.01:
+                        dir_x, dir_y = dx / d_len, dy / d_len
+                    else:
+                        dir_x, dir_y = 1.0, 0.0
+                else:
+                    dir_x, dir_y = 1.0, 0.0
+
+                annotations.append({
+                    "anchor_x": anchor_x,
+                    "anchor_y": anchor_y,
+                    "dir_x": dir_x,
+                    "dir_y": dir_y,
+                    "delay": delay,
+                    "magnitude": magnitude,
+                    "icon_cat": icon_cat,
+                    "priority": priority,
+                })
+
     total = n_hatched_red + n_hatched_grey + n_solid
     print(f"  ⚠ Incidents: {total} dessinés "
           f"({n_hatched_red} fermé, {n_hatched_grey} travaux/météo, {n_solid} bouchons)"
           f" — {n_downloaded}/{n_tiles} tuiles")
-    return inc_img
+
+    if collect_annotations and annotations:
+        print(f"  🏷 Annotations: {len(annotations)} incidents à annoter")
+
+    return inc_img, annotations
+
+
+def _polyline_midpoint(coords):
+    """Calcule le point milieu d'une polyligne (par longueur cumulée)."""
+    if len(coords) < 2:
+        return coords[0] if coords else (0, 0)
+
+    # Calculer la longueur totale
+    total_len = 0.0
+    seg_lengths = []
+    for i in range(len(coords) - 1):
+        d = math.hypot(coords[i+1][0] - coords[i][0],
+                       coords[i+1][1] - coords[i][1])
+        seg_lengths.append(d)
+        total_len += d
+
+    if total_len < 1:
+        return coords[0]
+
+    # Trouver le point à mi-chemin
+    target = total_len / 2.0
+    accumulated = 0.0
+    for i, seg_len in enumerate(seg_lengths):
+        if accumulated + seg_len >= target:
+            # Interpoler sur ce segment
+            remaining = target - accumulated
+            t = remaining / seg_len if seg_len > 0 else 0
+            x = coords[i][0] + t * (coords[i+1][0] - coords[i][0])
+            y = coords[i][1] + t * (coords[i+1][1] - coords[i][1])
+            return (x, y)
+        accumulated += seg_len
+
+    # Fallback
+    return coords[-1]
 
 
 def _draw_hatched_tube(draw, coords, colors, outline_w, main_w):
-    """
-    Dessine un tube hachuré TomTom le long d'une polyligne.
-    """
+    """Dessine un tube hachuré TomTom le long d'une polyligne."""
     color, grey_fill = colors
-
     if len(coords) < 2:
         return
 
-    # 1. Contour fin coloré (outline)
     draw.line(coords, fill=color, width=outline_w, joint="curve")
-
-    # 2. Fond gris clair (remplissage du tube)
     draw.line(coords, fill=grey_fill, width=main_w, joint="curve")
 
-    # 3. Carrés colorés le long du chemin
-    # Taille du carré = main_w (pleine hauteur, aussi large que haut)
     square_size = max(2, main_w)
-    # Espacement : 1/3 carré + 2/3 vide = le carré occupe 1/3 de chaque unité
-    unit_size = square_size * 3.0  # distance entre le début d'un carré et le suivant
+    unit_size = square_size * 3.0
     half_sq = square_size / 2.0
     half_w = main_w / 2.0
 
-    # Parcourir le chemin et placer des carrés
     seg_idx = 0
     seg_consumed = half_sq
 
@@ -937,87 +782,229 @@ def _draw_hatched_tube(draw, coords, colors, outline_w, main_w):
         seg_idx += 1
 
 
-def parse_mvt_tile_incidents(data):
+# ─── Annotations — Badges de délai ───────────────────────────────────────────
+
+def _get_annotation_font():
+    """Charge la police pour les annotations."""
+    # Essayer DejaVu Sans Bold (disponible sur Ubuntu / GitHub Actions)
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    ]
+    for path in font_paths:
+        try:
+            return ImageFont.truetype(path, ANNOTATION_FONT_SIZE)
+        except (OSError, IOError):
+            continue
+    # Fallback — police par défaut de Pillow (moins jolie mais fonctionnelle)
+    try:
+        return ImageFont.load_default(size=ANNOTATION_FONT_SIZE)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _format_delay(seconds):
+    """Formate un délai en texte lisible pour le badge."""
+    minutes = seconds // 60
+    if minutes < 1:
+        return None  # Trop court, pas d'annotation
+    if minutes < 60:
+        return f"+{minutes}min"
+    hours = minutes // 60
+    remaining_min = minutes % 60
+    if remaining_min == 0:
+        return f"+{hours}h"
+    return f"+{hours}h{remaining_min:02d}"
+
+
+def _draw_annotations(image, annotations, supersample_factor):
     """
-    Parse une tuile MVT et retourne les features du layer 'Traffic incident flow'.
+    Dessine les badges de délai sur l'image finale (après downscale).
+    Chaque badge est :
+      - positionné à l'ARRIÈRE de l'incident (début de la géométrie)
+      - décalé vers la DROITE du sens de circulation
+      - relié au point d'ancrage par un petit cône (bulle de dialogue)
+
+    annotations : liste de dicts avec anchor_x, anchor_y, dir_x, dir_y
+                  (en pixels supersamplés), delay, magnitude, icon_cat, priority
+    supersample_factor : facteur de supersampling (pour convertir les coords)
     """
-    if not data or len(data) < 2:
-        return []
+    if not annotations:
+        return
 
-    tile = _parse_protobuf(data)
-    features_out = []
+    font = _get_annotation_font()
+    draw = ImageDraw.Draw(image)
+    pad_x, pad_y = ANNOTATION_PADDING
 
-    for layer_data in tile.get(3, []):
-        layer = _parse_protobuf(layer_data)
+    # Trier par priorité descendante + delay (les plus importants placés en premier)
+    annotations.sort(key=lambda a: (-a["priority"], -a["delay"]))
 
-        name = layer.get(1, [b''])[0]
-        if isinstance(name, bytes):
-            name = name.decode('utf-8', errors='ignore')
+    # Liste des rectangles occupés pour l'anti-chevauchement
+    occupied = []
 
-        if name != "Traffic incident flow":
+    n_drawn = 0
+    n_skipped = 0
+
+    for ann in annotations:
+        # Convertir les coordonnées supersamplées → viewport
+        anchor_x = ann["anchor_x"] / supersample_factor
+        anchor_y = ann["anchor_y"] / supersample_factor
+        dir_x = ann["dir_x"]
+        dir_y = ann["dir_y"]
+
+        # Vérifier que l'ancrage est dans le viewport
+        if anchor_x < 0 or anchor_x > VIEWPORT_WIDTH or \
+           anchor_y < 0 or anchor_y > VIEWPORT_HEIGHT:
             continue
 
-        extent = layer.get(5, [4096])[0]
+        # Formater le texte
+        text = _format_delay(ann["delay"])
+        if text is None:
+            continue
 
-        keys = []
-        for k in layer.get(3, []):
-            keys.append(k.decode('utf-8', errors='ignore') if isinstance(k, bytes) else str(k))
+        # Mesurer le texte
+        bbox = font.getbbox(text)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        badge_w = text_w + 2 * pad_x
+        badge_h = text_h + 2 * pad_y
 
-        values = []
-        for v_data in layer.get(4, []):
-            v_fields = _parse_protobuf(v_data)
-            if 1 in v_fields:
-                val = v_fields[1][0]
-                values.append(val.decode('utf-8', errors='ignore') if isinstance(val, bytes) else str(val))
-            elif 2 in v_fields:
-                values.append(v_fields[2][0])
-            elif 3 in v_fields:
-                values.append(v_fields[3][0])
-            elif 4 in v_fields:
-                values.append(v_fields[4][0])
-            elif 5 in v_fields:
-                values.append(v_fields[5][0])
-            elif 6 in v_fields:
-                values.append(_decode_zigzag(v_fields[6][0]))
-            elif 7 in v_fields:
-                values.append(bool(v_fields[7][0]))
-            else:
-                values.append(None)
+        # Perpendiculaire DROITE du sens de circulation (screen coords, Y vers le bas)
+        # Droite = (-dir_y, dir_x)
+        perp_x = -dir_y
+        perp_y = dir_x
 
-        for feat_data in layer.get(2, []):
-            feat = _parse_protobuf(feat_data)
+        # Position du centre du badge = ancrage + perpendiculaire × distance
+        # La distance est calculée jusqu'au BORD du badge (pas son centre),
+        # pour que le cône soit toujours visible entre la route et le badge.
+        # On ajoute la demi-dimension du badge qui fait face à l'ancrage.
+        edge_offset = abs(perp_x) * (badge_w / 2) + abs(perp_y) * (badge_h / 2)
+        total_offset = ANNOTATION_OFFSET_DISTANCE + edge_offset
+        badge_cx = anchor_x + perp_x * total_offset
+        badge_cy = anchor_y + perp_y * total_offset
 
-            tags_raw = _decode_packed_uint32(feat.get(2, [b''])[0]) if 2 in feat and isinstance(feat[2][0], bytes) else []
-            props = {}
-            for j in range(0, len(tags_raw) - 1, 2):
-                k_idx = tags_raw[j]
-                v_idx = tags_raw[j + 1]
-                if k_idx < len(keys) and v_idx < len(values):
-                    props[keys[k_idx]] = values[v_idx]
+        # Rectangle du badge
+        badge_x1 = int(badge_cx - badge_w / 2)
+        badge_y1 = int(badge_cy - badge_h / 2)
+        badge_x2 = badge_x1 + badge_w
+        badge_y2 = badge_y1 + badge_h
 
-            geom_raw = feat.get(4, [b''])[0]
-            if isinstance(geom_raw, bytes) and len(geom_raw) > 0:
-                geometry = _decode_geometry(geom_raw)
-            else:
-                geometry = []
+        # Garder le badge dans le viewport (avec marge)
+        margin = 3
+        if badge_x1 < margin:
+            shift = margin - badge_x1
+            badge_x1 += shift
+            badge_x2 += shift
+            badge_cx += shift
+        if badge_y1 < margin:
+            shift = margin - badge_y1
+            badge_y1 += shift
+            badge_y2 += shift
+            badge_cy += shift
+        if badge_x2 > VIEWPORT_WIDTH - margin:
+            shift = badge_x2 - (VIEWPORT_WIDTH - margin)
+            badge_x1 -= shift
+            badge_x2 -= shift
+            badge_cx -= shift
+        if badge_y2 > VIEWPORT_HEIGHT - margin:
+            shift = badge_y2 - (VIEWPORT_HEIGHT - margin)
+            badge_y1 -= shift
+            badge_y2 -= shift
+            badge_cy -= shift
 
-            if geometry:
-                features_out.append({
-                    'geometry': geometry,
-                    'tags': props,
-                    'extent': extent,
-                })
+        # Anti-chevauchement : vérifier la distance avec les badges existants
+        too_close = False
+        for (ox1, oy1, ox2, oy2) in occupied:
+            other_cx = (ox1 + ox2) / 2
+            other_cy = (oy1 + oy2) / 2
+            dist = math.hypot(badge_cx - other_cx, badge_cy - other_cy)
+            if dist < ANNOTATION_MIN_DISTANCE:
+                too_close = True
+                break
 
-    return features_out
+        if too_close:
+            n_skipped += 1
+            continue
+
+        # Choisir la couleur de fond
+        if ann["icon_cat"] == 6:  # Jam → couleur par magnitude
+            bg_color = ANNOTATION_BADGE_COLORS.get(
+                ann["magnitude"], ANNOTATION_BADGE_COLORS[0]
+            )
+        else:
+            bg_color = ANNOTATION_DEFAULT_BADGE_COLOR
+
+        # ─── Dessiner le cône AVANT le badge (bulle de dialogue) ──────
+        # Le badge sera dessiné par-dessus, couvrant proprement la base du cône.
+        tip_x = int(round(anchor_x))
+        tip_y = int(round(anchor_y))
+
+        # Déterminer quel bord du badge fait face à l'ancrage
+        edge_centers = {
+            "top":    (badge_cx, badge_y1),
+            "bottom": (badge_cx, badge_y2),
+            "left":   (badge_x1, badge_cy),
+            "right":  (badge_x2, badge_cy),
+        }
+        closest_edge = min(edge_centers, key=lambda e: math.hypot(
+            edge_centers[e][0] - anchor_x, edge_centers[e][1] - anchor_y
+        ))
+        edge_x, edge_y = edge_centers[closest_edge]
+
+        # Base du cône sur le bord le plus proche
+        half_cone = ANNOTATION_CONE_WIDTH / 2
+        if closest_edge in ("top", "bottom"):
+            base1 = (int(edge_x - half_cone), int(edge_y))
+            base2 = (int(edge_x + half_cone), int(edge_y))
+        else:
+            base1 = (int(edge_x), int(edge_y - half_cone))
+            base2 = (int(edge_x), int(edge_y + half_cone))
+
+        # Dessiner le cône : fond couleur badge + contour sombre
+        cone_pts = [(tip_x, tip_y), base1, base2]
+        draw.polygon(cone_pts, fill=bg_color, outline=ANNOTATION_BORDER_COLOR)
+
+        # ─── Dessiner le badge PAR-DESSUS le cône ─────────────────────
+        # 1. Bordure
+        draw.rounded_rectangle(
+            [badge_x1 - ANNOTATION_BORDER_WIDTH,
+             badge_y1 - ANNOTATION_BORDER_WIDTH,
+             badge_x2 + ANNOTATION_BORDER_WIDTH,
+             badge_y2 + ANNOTATION_BORDER_WIDTH],
+            radius=ANNOTATION_CORNER_RADIUS + ANNOTATION_BORDER_WIDTH,
+            fill=ANNOTATION_BORDER_COLOR,
+        )
+        # 2. Fond coloré
+        draw.rounded_rectangle(
+            [badge_x1, badge_y1, badge_x2, badge_y2],
+            radius=ANNOTATION_CORNER_RADIUS,
+            fill=bg_color,
+        )
+        # 3. Texte centré
+        text_x = badge_x1 + pad_x - bbox[0]
+        text_y = badge_y1 + pad_y - bbox[1]
+        draw.text((text_x, text_y), text, fill=ANNOTATION_TEXT_COLOR, font=font)
+
+        occupied.append((badge_x1, badge_y1, badge_x2, badge_y2))
+        n_drawn += 1
+
+    if n_drawn > 0 or n_skipped > 0:
+        print(f"  🏷 Annotations dessinées: {n_drawn} badges"
+              f" ({n_skipped} masqués pour chevauchement)")
 
 
 # ─── Capture d'une zone ──────────────────────────────────────────────────────
 
-def capture_zone(zone_name, zone_url, api_key, now):
-    """Capture complète d'une zone : base + flow + incidents."""
+def capture_zone(zone_name, zone_config, api_key, now):
+    """Capture complète d'une zone : base + flow + incidents + annotations."""
+    zone_url = zone_config["url"]
+    want_annotations = zone_config.get("annotations", False)
+
     lat, lon, zoom = parse_zone_url(zone_url)
     print(f"\n{'─'*60}")
-    print(f"[{zone_name}] lat={lat} lon={lon} zoom={zoom}")
+    print(f"[{zone_name}] lat={lat} lon={lon} zoom={zoom}"
+          f" annotations={'ON' if want_annotations else 'OFF'}")
 
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H%M")
@@ -1028,16 +1015,10 @@ def capture_zone(zone_name, zone_url, api_key, now):
     tile_render_size = TILE_SIZE * SUPERSAMPLE
 
     if SUPERSAMPLE > 1:
-        print(f"  🔍 Supersampling ×{SUPERSAMPLE} — rendu {render_w}×{render_h} → downscale {VIEWPORT_WIDTH}×{VIEWPORT_HEIGHT}")
+        print(f"  🔍 Supersampling ×{SUPERSAMPLE} — rendu {render_w}×{render_h}"
+              f" → downscale {VIEWPORT_WIDTH}×{VIEWPORT_HEIGHT}")
 
-    # 1. Carte de base
-    # IMPORTANT : la base map est TOUJOURS demandée à VIEWPORT_WIDTH × VIEWPORT_HEIGHT,
-    # indépendamment du supersampling. L'API Static Image TomTom utilise des tuiles
-    # internes de 512px — sa zone géographique correspond exactement au viewport 1920×1080.
-    # Si on demandait render_w × render_h (ex. 3840×2160), l'API couvrirait 2× la zone
-    # géographique → décalage entre fond de carte et couches vectorielles.
-    # On upscale ensuite en RAM (LANCZOS) avant de composer avec flow et incidents.
-    # Le cache est nommé sans _ss car il est indépendant du supersampling.
+    # 1. Carte de base (toujours à VIEWPORT size, puis upscale en RAM)
     cache_path = CACHE_DIR / f"{zone_name}_z{zoom}.png"
     if cache_path.exists():
         print(f"  📦 Base map: cache OK")
@@ -1051,21 +1032,22 @@ def capture_zone(zone_name, zone_url, api_key, now):
         base_img.save(str(cache_path), "PNG")
         print(f"  💾 Base map cachée localement")
 
-    # Upscaler la base à la résolution de rendu pour la composition
     if SUPERSAMPLE > 1:
         base_img = base_img.resize((render_w, render_h), Image.LANCZOS)
 
-    # 2. Traffic Flow — rendu à résolution supersamplée
+    # 2. Traffic Flow
     flow_img = download_vector_flow(
         lat, lon, zoom, render_w, render_h, api_key,
         tile_render_size=tile_render_size
     )
 
-    # 3. Incidents — rendu à résolution supersamplée
+    # 3. Incidents (+ collecte des annotations si activé)
+    annotations = []
     if INCIDENTS_ENABLED:
-        inc_img = download_incidents(
+        inc_img, annotations = download_incidents(
             lat, lon, zoom, render_w, render_h, api_key,
-            tile_render_size=tile_render_size
+            tile_render_size=tile_render_size,
+            collect_annotations=want_annotations,
         )
     else:
         inc_img = Image.new("RGBA", (render_w, render_h), (0, 0, 0, 0))
@@ -1077,14 +1059,16 @@ def capture_zone(zone_name, zone_url, api_key, now):
     composite = Image.alpha_composite(composite, inc_img)
 
     # 5. Downscale LANCZOS → résolution finale
-    #    Le filtre LANCZOS crée un anti-aliasing naturel : les lignes sont lissées
-    #    exactement comme le ferait un rendu GPU/WebGL.
     if SUPERSAMPLE > 1:
         composite = composite.resize(
             (VIEWPORT_WIDTH, VIEWPORT_HEIGHT), Image.LANCZOS
         )
 
-    # 6. Sauvegarder en JPEG
+    # 6. Annotations — dessinées APRÈS le downscale pour un texte net
+    if want_annotations and annotations:
+        _draw_annotations(composite, annotations, SUPERSAMPLE)
+
+    # 7. Sauvegarder en JPEG
     zone_dir = OUTPUT_DIR / date_str / zone_name
     zone_dir.mkdir(parents=True, exist_ok=True)
     out_path = zone_dir / f"{date_str}-{time_str}_{zone_name}.jpg"
@@ -1096,11 +1080,7 @@ def capture_zone(zone_name, zone_url, api_key, now):
 
 
 def save_bases(api_key):
-    """
-    Télécharge et archive les cartes de base — appelée 1× par run.
-    Structure : bases/YYYY-MM-DD/zone_name/YYYY-MM-DD-HHMM_zone_name_base.jpg
-    Met aussi à jour le cache local (.base-cache/) pour les cycles suivants.
-    """
+    """Télécharge et archive les cartes de base — appelée 1× par run."""
     now = datetime.now(TIMEZONE)
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H%M")
@@ -1111,22 +1091,20 @@ def save_bases(api_key):
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    for zone_name, zone_url in ZONES.items():
+    for zone_name, zone_config in ZONES.items():
+        zone_url = zone_config["url"]
         lat, lon, zoom = parse_zone_url(zone_url)
         print(f"\n[{zone_name}] zoom={zoom}")
 
-        # Base map toujours demandée à la résolution viewport (cf. commentaire dans capture_zone)
         base_img = download_base_image(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, api_key)
         if base_img is None:
             print(f"  ✗ Échec téléchargement base")
             continue
 
-        # Cache local — nommé sans _ss, indépendant du supersampling
         cache_path = CACHE_DIR / f"{zone_name}_z{zoom}.png"
         base_img.save(str(cache_path), "PNG")
         print(f"  💾 Cache local: {cache_path}")
 
-        # Archivage — à la résolution viewport (pas besoin d'upscaler pour l'archive)
         base_dir = BASES_DIR / date_str / zone_name
         base_dir.mkdir(parents=True, exist_ok=True)
         base_path = base_dir / f"{date_str}-{time_str}_{zone_name}_base.jpg"
@@ -1166,11 +1144,6 @@ def clear_stale_cache():
 
 # ─── Budget API ───────────────────────────────────────────────────────────────
 
-DAILY_QUOTA = 50_000  # Requêtes gratuites TomTom par jour
-CYCLES_PER_RUN = 36   # 6h / 10 min
-RUNS_PER_DAY = 4      # cron toutes les 6h
-
-
 def _count_tiles_for_zone(lat, lon, zoom):
     """Compte le nombre de tuiles nécessaires pour couvrir le viewport."""
     tiles, _, _ = get_tile_grid(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, TILE_SIZE)
@@ -1178,10 +1151,7 @@ def _count_tiles_for_zone(lat, lon, zoom):
 
 
 def print_budget_report():
-    """
-    Affiche le rapport de consommation API estimée.
-    Appelé au début de chaque run.
-    """
+    """Affiche le rapport de consommation API estimée."""
     print(f"\n{'─'*65}")
     print("📊 BUDGET API — Estimation de consommation")
     print(f"{'─'*65}")
@@ -1189,17 +1159,18 @@ def print_budget_report():
     total_per_cycle = 0
     total_base_per_run = 0
 
-    for name, url in ZONES.items():
-        lat, lon, zoom = parse_zone_url(url)
+    for name, zone_config in ZONES.items():
+        lat, lon, zoom = parse_zone_url(zone_config["url"])
         n_tiles = _count_tiles_for_zone(lat, lon, zoom)
         road_types = ROAD_TYPES_BY_ZOOM.get(zoom, [0, 1, 2, 3])
 
-        flow = n_tiles      # vector flow tiles
-        inc = n_tiles        # vector incident tiles
-        base = 1             # static image (1× par run)
+        flow = n_tiles
+        inc = n_tiles
+        base = 1
         per_cycle = flow + inc
 
-        print(f"  {name} (zoom={zoom}, roadTypes={road_types})")
+        ann_tag = " 🏷" if zone_config.get("annotations", False) else ""
+        print(f"  {name} (zoom={zoom}, roadTypes={road_types}){ann_tag}")
         print(f"    {n_tiles} tuiles × 2 couches = {per_cycle}/cycle  |  base: {base}/run")
 
         total_per_cycle += per_cycle
@@ -1210,7 +1181,6 @@ def print_budget_report():
     pct = daily_cost * 100 / DAILY_QUOTA
     remaining = DAILY_QUOTA - daily_cost
 
-    # Combien de zones supplémentaires possibles
     if total_per_cycle > 0:
         avg_per_zone = total_per_cycle // len(ZONES)
         extra_zones = remaining // (avg_per_zone * CYCLES_PER_RUN * RUNS_PER_DAY) if avg_per_zone > 0 else 0
@@ -1256,34 +1226,30 @@ if __name__ == "__main__":
 
     # Afficher les zones configurées
     print("\nZones configurées:")
-    for name, url in ZONES.items():
-        lat, lon, zoom = parse_zone_url(url)
+    for name, zone_config in ZONES.items():
+        lat, lon, zoom = parse_zone_url(zone_config["url"])
         road_types = ROAD_TYPES_BY_ZOOM.get(zoom, [0, 1, 2, 3])
-        print(f"  ✓ {name}: lat={lat} lon={lon} zoom={zoom} roadTypes={road_types}")
+        ann = "✓" if zone_config.get("annotations", False) else "X"
+        print(f"  ✓ {name}: zoom={zoom} roadTypes={road_types} annotations={ann}")
 
-    # Rapport de budget au début de chaque exécution
     print_budget_report()
-
     clear_stale_cache()
 
     if args.save_bases:
-        # Mode base uniquement — 1× par run
         save_bases(api_key)
     else:
-        # Mode cycle — capture flow + incidents
         counter = 0
         errors = 0
 
-        for zone_name, zone_url in ZONES.items():
+        for zone_name, zone_config in ZONES.items():
             try:
-                capture_zone(zone_name, zone_url, api_key, now)
+                capture_zone(zone_name, zone_config, api_key, now)
             except Exception as e:
                 print(f"[{zone_name}] ✗ Erreur: {e}")
                 import traceback
                 traceback.print_exc()
                 errors += 1
 
-        # Résumé
         print(f"\n{'═'*60}")
         print(f"Résumé: {len(ZONES) - errors}/{len(ZONES)} zones OK")
         print(f"Requêtes API: {counter}")
