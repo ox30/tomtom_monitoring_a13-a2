@@ -74,10 +74,25 @@ jobs:
 
       - name: Upload vers Proton Drive
         run: |
-          echo "🚀 Upload captures-${{ env.DATE }}.zip vers Proton Drive..."
-          rclone copy /tmp/captures-${{ env.DATE }}.zip proton:A13-A2/ \
-            --progress --stats-one-line
-          echo "✅ Archivé sur Proton Drive : A13-A2/captures-${{ env.DATE }}.zip"
+          LOCAL_SIZE=${{ env.ZIP_SIZE_BYTES }}
+          REMOTE_SIZE=$(rclone size proton:A13-A2/captures-${{ env.DATE }}.zip --json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('bytes',0))" 2>/dev/null || echo "0")
+
+          if [ "$REMOTE_SIZE" = "0" ]; then
+            echo "🚀 Nouveau fichier — upload captures-${{ env.DATE }}.zip..."
+            rclone copy /tmp/captures-${{ env.DATE }}.zip proton:A13-A2/ \
+              --progress --stats-one-line
+            echo "✅ Archivé sur Proton Drive"
+          elif [ "$REMOTE_SIZE" != "$LOCAL_SIZE" ]; then
+            echo "⚠ Fichier existant incomplet ou différent (local=${LOCAL_SIZE} / remote=${REMOTE_SIZE})"
+            echo "🗑 Suppression de l'ancien fichier..."
+            rclone deletefile proton:A13-A2/captures-${{ env.DATE }}.zip
+            echo "🚀 Ré-upload..."
+            rclone copy /tmp/captures-${{ env.DATE }}.zip proton:A13-A2/ \
+              --progress --stats-one-line
+            echo "✅ Fichier remplacé sur Proton Drive"
+          else
+            echo "✓ Fichier identique déjà présent (${LOCAL_SIZE} bytes) — skip"
+          fi
 
       - name: Vérifier l'upload
         run: |
