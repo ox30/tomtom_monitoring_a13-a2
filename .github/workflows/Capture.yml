@@ -172,8 +172,10 @@ jobs:
           git add captures/ 2>/dev/null || true
           git add bases/ 2>/dev/null || true
           git commit --amend --allow-empty -m "captures $(TZ=Europe/Zurich date '+%Y-%m-%d %H:%M %Z')" -q
-          git push --force origin captures-work:captures -q
-          echo "✓ Bases sauvegardées et pushées"
+          git push --force origin captures-work:captures -q || \
+            (echo "⚠ Push échoué — retry dans 10s..." && sleep 10 && git push --force origin captures-work:captures -q) || \
+            echo "⚠ Push bases échoué (2 tentatives) — on continue"
+          echo "✓ Bases sauvegardées"
 
           # ── Boucle de capture ──────────────────────────────────
           echo ""
@@ -208,8 +210,9 @@ jobs:
             git add captures/ 2>/dev/null || true
             git add bases/ 2>/dev/null || true
             git commit --amend --allow-empty -m "captures $(TZ=Europe/Zurich date '+%Y-%m-%d %H:%M %Z')" -q
-            git push --force origin captures-work:captures -q
-            echo "✓ Push OK"
+            git push --force origin captures-work:captures -q || \
+              (echo "⚠ Push échoué — retry dans 10s..." && sleep 10 && git push --force origin captures-work:captures -q) || \
+              echo "⚠ Push échoué (2 tentatives) — données conservées pour le prochain cycle"
 
             CYCLE_END=$(date +%s)
             CYCLE_DURATION=$((CYCLE_END - CYCLE_START))
