@@ -1,11 +1,11 @@
 [
   {
     "date": "2026-04-08",
-    "archived_at": "2026-04-15T20:41:11Z",
+    "archived_at": "2026-04-15T21:58:38Z",
     "zones": 5,
     "images": 720,
     "zip_file": "captures-2026-04-08.zip",
-    "zip_size_bytes": 293165251,
+    "zip_size_bytes": 293178319,
     "zip_size": "280M",
     "verified": true,
     "trigger": "workflow_dispatch"
