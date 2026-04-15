@@ -153,9 +153,9 @@ jobs:
 
       - name: Publier le journal sur GitHub (main)
         run: |
-          # Repartir de main
+          # Créer une branche locale basée sur main
           git fetch origin main --depth=1
-          git checkout origin/main -- . 2>/dev/null || true
+          git checkout -b update-log origin/main
 
           # Copier le journal
           cp /tmp/log/archive_log.json archive_log.json
@@ -166,7 +166,7 @@ jobs:
           git add archive_log.json
           git diff --cached --quiet && echo "Pas de changement" || \
             (git commit -m "📋 Archive log — ${{ env.DATE }}" && \
-             git push origin HEAD:main)
+             git push origin update-log:main)
 
       - name: Nettoyage rclone config
         if: always()
