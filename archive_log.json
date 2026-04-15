@@ -56,11 +56,11 @@
   },
   {
     "date": "2026-04-13",
-    "archived_at": "2026-04-15T21:26:57Z",
+    "archived_at": "2026-04-15T22:34:35Z",
     "zones": 5,
     "images": 715,
     "zip_file": "captures-2026-04-13.zip",
-    "zip_size_bytes": 291106989,
+    "zip_size_bytes": 291119967,
     "zip_size": "278M",
     "verified": true,
     "trigger": "workflow_dispatch"
