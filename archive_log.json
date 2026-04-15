@@ -1,0 +1,46 @@
+[
+  {
+    "date": "2026-04-08",
+    "archived_at": "2026-04-15T20:41:11Z",
+    "zones": 5,
+    "images": 720,
+    "zip_file": "captures-2026-04-08.zip",
+    "zip_size_bytes": 293165251,
+    "zip_size": "280M",
+    "verified": true,
+    "trigger": "workflow_dispatch"
+  },
+  {
+    "date": "2026-04-09",
+    "archived_at": "2026-04-15T20:52:47Z",
+    "zones": 5,
+    "images": 715,
+    "zip_file": "captures-2026-04-09.zip",
+    "zip_size_bytes": 291102892,
+    "zip_size": "278M",
+    "verified": true,
+    "trigger": "workflow_dispatch"
+  },
+  {
+    "date": "2026-04-10",
+    "archived_at": "2026-04-15T21:04:56Z",
+    "zones": 5,
+    "images": 715,
+    "zip_file": "captures-2026-04-10.zip",
+    "zip_size_bytes": 291100079,
+    "zip_size": "278M",
+    "verified": true,
+    "trigger": "workflow_dispatch"
+  },
+  {
+    "date": "2026-04-11",
+    "archived_at": "2026-04-15T21:12:35Z",
+    "zones": 5,
+    "images": 715,
+    "zip_file": "captures-2026-04-11.zip",
+    "zip_size_bytes": 290961794,
+    "zip_size": "278M",
+    "verified": true,
+    "trigger": "workflow_dispatch"
+  }
+]
