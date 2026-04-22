@@ -17,12 +17,18 @@ from zoneinfo import ZoneInfo
 #
 # annotations : True  → afficher les badges de délai sur les incidents annotés
 #               False → pas de badges (utile pour les vues larges / zoom faible)
+#
+# road_types_override : (optionnel) liste d'indices de types de routes pour
+#                       le flow. Remplace ROAD_TYPES_BY_ZOOM[zoom] pour cette
+#                       zone uniquement. S'applique UNIQUEMENT au flow, pas
+#                       aux incidents (ceux-ci sont filtrés par TomTom selon
+#                       le zoom).
+#                       Types: 0=Motorway 1=International 2=Major 3=Secondary
+#                              4=Connecting 5=MajorLocal 6=Local 7=MinorLocal
+#                       Exemple: [0, 1] = autoroutes + internationales
 
 ZONES = {
-    "zone_GST_Nord": {
-        "url": "https://plan.tomtom.com/en/?p=46.82968,8.60058,10z",
-        "annotations": True,
-    },
+
     "zone_Monitoring_2026": {
         "url": "https://plan.tomtom.com/en/?p=46.89357,9.49312,10z",
         "annotations": True,
@@ -39,14 +45,34 @@ ZONES = {
         "url": "https://plan.tomtom.com/en/?p=46.81697,9.48109,12z",
         "annotations": True,
     },
+    "zone_Globale": {
+        "url": "https://plan.tomtom.com/en/?p=46.58894,9.10568,8z",
+        "annotations": True,
+    },
+    "zone_Amsteg-Göschenen": {
+        "url": "https://plan.tomtom.com/en/?p=46.72234,8.63188,12z",
+        "annotations": True,
+    },
+    "zone_Erstfeld-Amsteg": {
+        "url": "https://plan.tomtom.com/en/?p=46.82056,8.66716,12z",
+        "annotations": True,
+    },
+    "zone_Wassen-Göschenen": {
+        "url": "https://plan.tomtom.com/en/?p=46.68434,8.60391,13z",
+        "annotations": True,
+        # Focus routes cantonales : exclure autoroutes (0) et internationales (1)
+        # du flow. Fallback zoom 13 serait [0, 1, 2, 3, 4].
+        "road_types_override": [2, 3, 4],
+    },
+    "zone_GST_Nord": {
+        "url": "https://plan.tomtom.com/en/?p=46.82968,8.60058,10z",
+        "annotations": True,
+    },
     "zone_GST_Sud": {
         "url": "https://plan.tomtom.com/en/?p=46.45552,8.76656,11z",
         "annotations": True,
     },
-    "zone_globale_A2_A13": {
-        "url": "https://plan.tomtom.com/en/?p=46.77047,8.61182,8z",
-        "annotations": False,
-    },
+
 }
 
 # ─── Dimensions et chemins ────────────────────────────────────────────────────
