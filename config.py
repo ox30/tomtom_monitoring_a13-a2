@@ -72,6 +72,10 @@ ZONES = {
         "url": "https://plan.tomtom.com/en/?p=46.45552,8.76656,11z",
         "annotations": True,
     },
+    "zone_Globale_Nord": {
+        "url": "https://plan.tomtom.com/en/?p=46.95,7.3,8z",
+        "annotations": True,
+    },
 
 }
 
