@@ -27,6 +27,14 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFont
 # ─── Import configuration ────────────────────────────────────────────────────
 from config import *
 
+# Notifications ntfy — import optionnel. Si config_ntfy.py absent ou mal formé,
+# le système continue sans notifs (les events restent loggés dans le JSON).
+try:
+    from config_ntfy import NTFY_NOTIFICATIONS, NTFY_EPISODE_OPEN_THRESHOLD
+except ImportError:
+    NTFY_NOTIFICATIONS = {}
+    NTFY_EPISODE_OPEN_THRESHOLD = 3
+
 # ─── Protobuf minimal parser ─────────────────────────────────────────────────
 
 def _decode_varint(data, pos):
@@ -373,15 +381,678 @@ def _offset_polyline(coords, offset_px):
 counter = 0
 
 
-def api_get(url, binary=False):
-    """Requête GET avec gestion d'erreurs."""
+def api_get(url, binary=False, zone_name=None, api_layer=None):
+    """Requête GET avec gestion d'erreurs.
+
+    zone_name, api_layer : utilisés uniquement pour le journal d'événements
+    (contexte lors de timeout ou d'HTTP error). Pas d'impact fonctionnel.
+    """
     global counter
     counter += 1
-    resp = requests.get(url, timeout=30)
+    try:
+        resp = requests.get(url, timeout=30)
+    except requests.exceptions.Timeout:
+        print(f"  ⚠ Timeout pour {url[:100]}...")
+        _log_event(
+            event_type="api_timeout",
+            zone=zone_name,
+            severity="warning",
+            details={
+                "api_layer": api_layer,
+                "url_endpoint": url.split("?")[0][:200],
+                "timeout_seconds": 30,
+            },
+        )
+        return None
+    except requests.exceptions.RequestException as e:
+        print(f"  ⚠ Erreur requête : {type(e).__name__}")
+        _log_event(
+            event_type="api_request_error",
+            zone=zone_name,
+            severity="warning",
+            details={
+                "api_layer": api_layer,
+                "url_endpoint": url.split("?")[0][:200],
+                "error_type": type(e).__name__,
+                "error_message": str(e)[:200],
+            },
+        )
+        return None
+
     if resp.status_code == 200:
         return resp.content if binary else resp.json()
+
     print(f"  ⚠ HTTP {resp.status_code} pour {url[:100]}...")
+    _log_event(
+        event_type="api_http_error",
+        zone=zone_name,
+        severity="error" if resp.status_code >= 500 else "warning",
+        details={
+            "api_layer": api_layer,
+            "status_code": resp.status_code,
+            "url_endpoint": url.split("?")[0][:200],
+        },
+    )
     return None
+
+
+# ─── Journal d'événements cycle-par-cycle ────────────────────────────────────
+#
+# Écrit un capture_errors.json dans captures/YYYY-MM-DD/ qui accompagne les
+# JPG du jour. Le fichier suit le même cycle de vie que les captures :
+#   - Poussé sur GitHub (branche captures) à chaque cycle
+#   - Embarqué dans le ZIP Proton par Archive.yml (zip -r)
+#   - Supprimé par rotate_old_days() après RETENTION_DAYS
+#
+# Types d'événements supportés :
+#   - api_timeout           : timeout requête TomTom
+#   - api_http_error        : HTTP 4xx/5xx
+#   - api_request_error     : autre erreur réseau (DNS, SSL, etc.)
+#   - partial_capture       : n_downloaded < n_tiles pour une couche
+#   - data_freeze           : ouverture d'épisode de gel (confirmé)
+#   - data_freeze_recovered : clôture d'épisode de gel
+#   - zone_capture_failed   : exception dans capture_zone
+#
+# Les variables _current_date_str et _current_local_time sont settées par
+# __main__ (et save_bases) avant tout appel à _log_event(). Si None, l'event
+# est silencieusement ignoré pour ne jamais faire planter la capture.
+
+_current_date_str = None      # "YYYY-MM-DD" en timezone locale (Zurich)
+_current_local_time = None    # "HH:MM" en timezone locale
+
+
+def _now_utc_iso():
+    """Horodatage UTC ISO sans microsecondes, suffixe Z (compat archive_log.json)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _error_log_path(date_str):
+    """Chemin du log d'erreurs pour une date donnée."""
+    return OUTPUT_DIR / date_str / "capture_errors.json"
+
+
+def _load_error_log(date_str):
+    """Charge le log existant ou retourne un squelette vierge."""
+    path = _error_log_path(date_str)
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {
+        "version": "1.0",
+        "date": date_str,
+        "last_updated_utc": _now_utc_iso(),
+        "events": [],
+    }
+
+
+def _save_error_log(date_str, log):
+    """Persiste le log. Silencieux en cas d'échec disque."""
+    path = _error_log_path(date_str)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        log["last_updated_utc"] = _now_utc_iso()
+        path.write_text(
+            json.dumps(log, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError as e:
+        print(f"  ⚠ Échec écriture {path.name} : {e}")
+
+
+def _log_event(event_type, zone=None, details=None, severity="warning"):
+    """Ajoute un événement au log du jour.
+
+    Écriture directe (read-modify-write à chaque appel) pour que les événements
+    soient persistés même si le processus plante ensuite. Coût négligeable
+    (fichier JSON de quelques KB, < 10 ms par écriture).
+
+    L'événement est également bufferisé en mémoire pour le dispatch ntfy de fin
+    de cycle (_process_cycle_notifications).
+
+    Si _current_date_str n'est pas set (situation anormale), l'event est
+    silencieusement ignoré pour ne pas propager une exception vers le code
+    de capture.
+    """
+    if _current_date_str is None:
+        return
+
+    event = {
+        "timestamp_utc": _now_utc_iso(),
+        "local_time": _current_local_time,
+        "zone": zone,
+        "type": event_type,
+        "severity": severity,
+        "details": details or {},
+    }
+
+    # Buffer mémoire pour le dispatch ntfy en fin de cycle
+    _current_cycle_events_buffer.append(event)
+
+    # Persistance directe dans le log JSON du jour
+    try:
+        log = _load_error_log(_current_date_str)
+        log["events"].append(event)
+        _save_error_log(_current_date_str, log)
+    except Exception as e:
+        # Pas question qu'un souci de log fasse planter une capture
+        print(f"  ⚠ Échec log événement ({event_type}) : {e}")
+
+
+# Buffer des événements du cycle courant (réinitialisé à chaque import Python)
+# Utilisé par _process_cycle_notifications() en fin de cycle
+_current_cycle_events_buffer = []
+
+
+# ─── Détection de fraîcheur des données API ──────────────────────────────────
+#
+# Chaque cycle du workflow GitHub Actions lance un nouveau processus Python,
+# donc les variables module-level sont réinitialisées toutes les 10 min.
+# Pour détecter un gel entre cycles, on persiste l'état dans un JSON sur /tmp
+# (qui survit entre commandes bash d'un même run GitHub Actions).
+#
+# Limite connue : au démarrage d'un nouveau run GitHub Actions (runner frais,
+# /tmp vide), le tout premier cycle ne peut pas comparer → pas de détection
+# sur ce cycle. À partir du 2e cycle, le check fonctionne normalement.
+#
+# La règle ≥ 50% des zones figées pour déclencher un événement "data_freeze"
+# évite les faux positifs nocturnes (ex : zone_Amsteg-Göschenen sans trafic
+# peut être byte-identique plusieurs cycles d'affilée sans qu'il y ait gel
+# côté TomTom).
+
+_FRESHNESS_STATE_FILE = Path(
+    os.environ.get("RUNNER_TEMP", "/tmp")
+) / "capture_freshness_state.json"
+
+_GLOBAL_GEL_THRESHOLD = 0.5   # Fraction de zones figées pour déclarer un gel global
+
+
+def _load_freshness_state():
+    """Charge l'état depuis le disque, ou renvoie un état vierge si absent/corrompu."""
+    default = {
+        "hashes": {},
+        "consecutive_frozen": {},
+        "freeze_event_open": {},
+        "first_frozen_at_utc": {},
+    }
+    if not _FRESHNESS_STATE_FILE.exists():
+        return default
+    try:
+        loaded = json.loads(_FRESHNESS_STATE_FILE.read_text())
+        # Compat : remplir les clés manquantes si on charge un vieux state
+        for k, v in default.items():
+            loaded.setdefault(k, v)
+        return loaded
+    except (json.JSONDecodeError, OSError):
+        return default
+
+
+def _save_freshness_state():
+    """Persiste l'état complet pour le prochain cycle. Silencieux si échec disque.
+
+    Préserve les épisodes ntfy si présents dans le fichier existant — ils sont
+    mis à jour par _process_cycle_notifications mais peuvent avoir été écrits
+    précédemment et ne doivent pas être effacés par un _save_freshness_state
+    intermédiaire (appelé depuis _check_data_freshness ou _process_cycle_events).
+    """
+    # Conserver episode_states si déjà présent dans le fichier
+    existing = {}
+    if _FRESHNESS_STATE_FILE.exists():
+        try:
+            existing = json.loads(_FRESHNESS_STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+
+    try:
+        _FRESHNESS_STATE_FILE.write_text(json.dumps({
+            "hashes": _last_flow_hash,
+            "consecutive_frozen": _consecutive_frozen,
+            "freeze_event_open": _freeze_event_open,
+            "first_frozen_at_utc": _first_frozen_at,
+            "episode_states": existing.get("episode_states", {}),
+        }))
+    except OSError:
+        pass
+
+
+# Chargement une seule fois à l'import du module
+_freshness_state = _load_freshness_state()
+_last_flow_hash = _freshness_state["hashes"]              # zone_name -> hash MD5
+_consecutive_frozen = _freshness_state["consecutive_frozen"]  # zone_name -> count
+_freeze_event_open = _freshness_state["freeze_event_open"]    # zone_name -> bool
+_first_frozen_at = _freshness_state["first_frozen_at_utc"]    # zone_name -> ISO|None
+
+
+def _check_data_freshness(zone_name, flow_bytes_list):
+    """
+    Détecte un gel de l'API TomTom en comparant les tuiles flow
+    au cycle précédent pour cette zone.
+
+    Un gel se manifeste quand TomTom sert des .pbf byte-for-byte identiques
+    pendant plusieurs cycles — signe que leur pipeline d'ingestion ou leur CDN
+    ne rafraîchit plus les tuiles. Le code continue normalement ; seul un
+    warning stdout est loggé ici pour alerter l'opérateur en direct.
+
+    Les événements structurés (data_freeze / data_freeze_recovered) sont émis
+    séparément par _process_cycle_events() à la fin du cycle, APRÈS avoir
+    appliqué la règle de majorité ≥ 50% des zones figées.
+
+    L'état est persisté sur /tmp entre invocations de python capture.py
+    (nécessaire car chaque cycle = nouveau processus Python).
+
+    Args:
+        zone_name         : nom de la zone (clé de suivi)
+        flow_bytes_list   : liste des bytes .pbf téléchargés pour cette zone
+    """
+    import hashlib
+
+    if not flow_bytes_list:
+        return
+
+    combined = b"".join(flow_bytes_list)
+    current = hashlib.md5(combined).hexdigest()[:12]
+    previous = _last_flow_hash.get(zone_name)
+
+    if previous == current:
+        n = _consecutive_frozen.get(zone_name, 0) + 1
+        _consecutive_frozen[zone_name] = n
+        print(f"  ⚠ DONNÉES GELÉES : tuiles flow identiques au cycle précédent"
+              f" (hash={current}, {n}× consécutifs) — gel API TomTom probable")
+    else:
+        prev_frozen = _consecutive_frozen.get(zone_name, 0)
+        if prev_frozen > 0:
+            print(f"  ✓ Données rafraîchies après {prev_frozen} cycle(s) gelé(s)")
+        _consecutive_frozen[zone_name] = 0
+
+    _last_flow_hash[zone_name] = current
+
+    # Persister immédiatement pour le prochain cycle
+    _save_freshness_state()
+
+
+def _process_cycle_events(zone_names):
+    """
+    Appelée à la fin du cycle, après traitement de toutes les zones.
+
+    Applique la règle de gel global (≥ 50% des zones avec consec_frozen ≥ 2)
+    et émet des événements 'data_freeze' (ouverture) / 'data_freeze_recovered'
+    (clôture) dans capture_errors.json. Une seule paire open/close par épisode,
+    pas de spam à chaque cycle pendant un gel prolongé.
+    """
+    if not zone_names:
+        return
+
+    n_total = len(zone_names)
+    n_frozen_2plus = sum(
+        1 for z in zone_names if _consecutive_frozen.get(z, 0) >= 2
+    )
+    global_gel = (n_frozen_2plus / n_total) >= _GLOBAL_GEL_THRESHOLD
+    now_iso = _now_utc_iso()
+
+    for zone in zone_names:
+        consec = _consecutive_frozen.get(zone, 0)
+        is_open = _freeze_event_open.get(zone, False)
+
+        # Ouverture : gel confirmé (≥ 2 cycles identiques ET majorité globale)
+        if consec >= 2 and global_gel and not is_open:
+            _first_frozen_at[zone] = now_iso
+            _freeze_event_open[zone] = True
+            _log_event(
+                event_type="data_freeze",
+                zone=zone,
+                severity="warning",
+                details={
+                    "consecutive_frozen_cycles": consec,
+                    "flow_hash": _last_flow_hash.get(zone, ""),
+                    "global_gel_context": {
+                        "frozen_zones_count": n_frozen_2plus,
+                        "total_zones_count": n_total,
+                        "threshold_met": True,
+                    },
+                },
+            )
+            print(f"  📝 Event loggé : data_freeze pour {zone}")
+
+        # Clôture : zone retourne à fresh alors qu'un épisode était ouvert
+        elif consec == 0 and is_open:
+            started = _first_frozen_at.get(zone)
+            duration_min = None
+            if started:
+                try:
+                    t0 = datetime.strptime(
+                        started, "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=timezone.utc)
+                    t1 = datetime.now(timezone.utc)
+                    duration_min = int((t1 - t0).total_seconds() / 60)
+                except (ValueError, TypeError):
+                    pass
+            _log_event(
+                event_type="data_freeze_recovered",
+                zone=zone,
+                severity="info",
+                details={
+                    "froze_from_utc": started,
+                    "froze_to_utc": now_iso,
+                    "duration_minutes": duration_min,
+                },
+            )
+            _freeze_event_open[zone] = False
+            _first_frozen_at[zone] = None
+            print(f"  📝 Event loggé : data_freeze_recovered pour {zone}"
+                  f" (durée {duration_min} min)")
+
+    _save_freshness_state()
+
+
+# ─── Notifications ntfy ──────────────────────────────────────────────────────
+#
+# Dispatch en fin de cycle selon le mode configuré par type d'événement
+# (dict NTFY_NOTIFICATIONS dans config_ntfy.py — optionnel) :
+#   - immediate        : notif à chaque cycle où l'event apparaît
+#   - batch_per_cycle  : 1 notif/cycle résumant tous les events du type
+#   - episode          : notif à l'ouverture (après N cycles consécutifs)
+#                        puis silence, notif à la clôture (1 cycle sans l'event)
+#
+# État d'épisode persisté dans le JSON freshness sous la clé "episode_states",
+# avec un dict par type d'event :
+#   { "api_http_error": {
+#       "streak_count": 2,                  # cycles consécutifs avec event présent
+#       "streak_first_seen_at_utc": "..",   # début du streak actuel
+#       "streak_event_sum": 107,            # total events pendant le streak
+#       "episode_open": false,
+#       "episode_start_at_utc": null,
+#       "episode_events_total": 0,
+#       "episode_cycles_total": 0,
+#     }, ... }
+
+_NTFY_TOPIC_URL = os.environ.get("NTFY_TOPIC_URL", "").strip()
+
+
+def _send_ntfy_notification(title, body, priority=3, tags=None):
+    """Envoi d'une notification ntfy. Silencieux en cas d'échec réseau.
+
+    title, body : texte (UTF-8 dans le body, ASCII recommandé pour title/tags
+                  car ce sont des en-têtes HTTP).
+    priority    : 1 (min) à 5 (max) — contrôle son/vibration de l'app.
+    tags        : liste de courts mots-clés (ntfy les rend en émojis si connus,
+                  ex: "warning" → ⚠, "white_check_mark" → ✅).
+    """
+    if not _NTFY_TOPIC_URL:
+        return  # Pas configuré → désactivé silencieusement
+
+    try:
+        headers = {
+            "Title": title.encode("ascii", errors="replace").decode("ascii"),
+            "Priority": str(priority),
+        }
+        if tags:
+            headers["Tags"] = ",".join(tags)
+        resp = requests.post(
+            _NTFY_TOPIC_URL,
+            data=body.encode("utf-8"),
+            headers=headers,
+            timeout=5,
+        )
+        if resp.status_code >= 400:
+            print(f"  ⚠ ntfy HTTP {resp.status_code} pour notif '{title}'")
+        else:
+            print(f"  📨 ntfy → {title}")
+    except requests.exceptions.RequestException as e:
+        print(f"  ⚠ ntfy échec ({type(e).__name__}) pour notif '{title}'")
+
+
+def _format_zones_list(zones, max_zones=8):
+    """Formate une liste de zones pour le corps d'une notif.
+
+    Si > max_zones, tronque avec '(+N autres)' pour éviter des notifs trop longues.
+    """
+    if not zones:
+        return "aucune zone identifiée"
+    unique = list(dict.fromkeys(zones))  # dedupe en gardant l'ordre
+    if len(unique) <= max_zones:
+        return ", ".join(unique)
+    return ", ".join(unique[:max_zones]) + f" (+{len(unique) - max_zones} autres)"
+
+
+def _notif_immediate(event_type, events_this_cycle, cfg):
+    """Mode immediate : 1 notif par cycle agrégée (toutes zones dans le body)."""
+    if not events_this_cycle:
+        return
+
+    zones = [e.get("zone") for e in events_this_cycle if e.get("zone")]
+    title = cfg.get("title", event_type)
+
+    if event_type == "data_freeze":
+        n = len(events_this_cycle)
+        body = (
+            f"Cycle {_current_local_time} CEST\n"
+            f"{n} zone(s) figee(s) (gel API TomTom probable)\n\n"
+            f"Zones : {_format_zones_list(zones)}"
+        )
+    elif event_type == "data_freeze_recovered":
+        n = len(events_this_cycle)
+        durations = [
+            e["details"].get("duration_minutes")
+            for e in events_this_cycle
+            if e["details"].get("duration_minutes") is not None
+        ]
+        dur_info = f" (durée ~{max(durations)} min)" if durations else ""
+        body = (
+            f"Cycle {_current_local_time} CEST\n"
+            f"{n} zone(s) ont retrouve des donnees fraiches{dur_info}\n\n"
+            f"Zones : {_format_zones_list(zones)}"
+        )
+    elif event_type == "zone_capture_failed":
+        n = len(events_this_cycle)
+        details_summary = []
+        for e in events_this_cycle:
+            d = e.get("details", {})
+            details_summary.append(
+                f"- {e.get('zone')} : {d.get('exception_type', '?')}"
+            )
+        body = (
+            f"Cycle {_current_local_time} CEST\n"
+            f"{n} zone(s) en echec (exception capture_zone)\n\n"
+            + "\n".join(details_summary)
+        )
+    else:
+        body = (
+            f"Cycle {_current_local_time} CEST\n"
+            f"{len(events_this_cycle)} evenement(s)\n\n"
+            f"Zones : {_format_zones_list(zones)}"
+        )
+
+    _send_ntfy_notification(
+        title=title,
+        body=body,
+        priority=cfg.get("priority", 3),
+        tags=cfg.get("tags", []),
+    )
+
+
+def _notif_batch(event_type, events_this_cycle, cfg):
+    """Mode batch_per_cycle : 1 notif/cycle résumant tous les events."""
+    if not events_this_cycle:
+        return
+
+    zones = [e.get("zone") for e in events_this_cycle if e.get("zone")]
+    n = len(events_this_cycle)
+    title = cfg.get("title", event_type)
+
+    body = (
+        f"Cycle {_current_local_time} CEST\n"
+        f"{n} evenement(s) detecte(s) sur {len(set(zones))} zone(s)\n\n"
+        f"Zones : {_format_zones_list(zones)}"
+    )
+
+    _send_ntfy_notification(
+        title=title,
+        body=body,
+        priority=cfg.get("priority", 2),
+        tags=cfg.get("tags", []),
+    )
+
+
+def _notif_episode(event_type, events_this_cycle, cfg, episode_state):
+    """Mode episode : suivi de streak avec ouverture après N cycles consécutifs.
+
+    Met à jour episode_state en place et envoie les notifs d'ouverture / clôture
+    quand les seuils sont atteints.
+    Reset dur : 1 cycle sans event remet streak_count à 0.
+    Clôture : 1 cycle sans event suffit pour clôturer un épisode ouvert.
+    """
+    threshold = NTFY_EPISODE_OPEN_THRESHOLD
+    event_count = len(events_this_cycle)
+    zones = list(dict.fromkeys(
+        e.get("zone") for e in events_this_cycle if e.get("zone")
+    ))
+
+    if event_count > 0:
+        # Apparition de l'event sur ce cycle
+        if episode_state["streak_count"] == 0:
+            # Nouveau streak — premier cycle d'apparition
+            episode_state["streak_first_seen_at_utc"] = _now_utc_iso()
+            episode_state["streak_event_sum"] = 0
+        episode_state["streak_count"] += 1
+        episode_state["streak_event_sum"] += event_count
+
+        if episode_state["episode_open"]:
+            # Épisode déjà ouvert — on cumule juste, pas de notif
+            episode_state["episode_events_total"] += event_count
+            episode_state["episode_cycles_total"] += 1
+
+        elif episode_state["streak_count"] >= threshold:
+            # Seuil atteint → OUVERTURE de l'épisode
+            episode_state["episode_open"] = True
+            episode_state["episode_start_at_utc"] = episode_state["streak_first_seen_at_utc"]
+            episode_state["episode_events_total"] = episode_state["streak_event_sum"]
+            episode_state["episode_cycles_total"] = episode_state["streak_count"]
+
+            # Notif d'ouverture
+            title = cfg.get("title_open", cfg.get("title", event_type))
+            start_time = episode_state["episode_start_at_utc"]
+            body = (
+                f"Detecte sur {threshold} cycles consecutifs.\n"
+                f"Debut observe : {start_time} UTC\n"
+                f"Cycle actuel ({_current_local_time}) : {event_count} evenement(s)\n\n"
+                f"Zones touchees ce cycle : {_format_zones_list(zones)}\n\n"
+                f"Total depuis debut : {episode_state['episode_events_total']} evenement(s)\n"
+                f"Note : pas de nouvelle notif avant la resolution."
+            )
+            _send_ntfy_notification(
+                title=title,
+                body=body,
+                priority=cfg.get("priority", 4),
+                tags=cfg.get("tags", []),
+            )
+
+    else:
+        # Pas d'event de ce type ce cycle — reset dur du streak
+        if episode_state["episode_open"]:
+            # CLÔTURE de l'épisode
+            episode_state["episode_open"] = False
+            title = cfg.get("title_close", cfg.get("title", event_type))
+
+            # Calcul de la durée
+            start = episode_state.get("episode_start_at_utc")
+            duration_str = "inconnue"
+            if start:
+                try:
+                    t0 = datetime.strptime(start, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                    t1 = datetime.now(timezone.utc)
+                    total_min = int((t1 - t0).total_seconds() / 60)
+                    if total_min < 60:
+                        duration_str = f"{total_min} min"
+                    else:
+                        h = total_min // 60
+                        m = total_min % 60
+                        duration_str = f"{h}h{m:02d}"
+                except (ValueError, TypeError):
+                    pass
+
+            body = (
+                f"Episode resolu au cycle {_current_local_time} CEST.\n\n"
+                f"Duree : {duration_str}\n"
+                f"Cycles affectes : {episode_state['episode_cycles_total']}\n"
+                f"Total evenements : {episode_state['episode_events_total']}"
+            )
+            _send_ntfy_notification(
+                title=title,
+                body=body,
+                priority=cfg.get("priority", 3),
+                tags=["white_check_mark"],
+            )
+
+            # Reset complet des compteurs d'épisode
+            episode_state["episode_start_at_utc"] = None
+            episode_state["episode_events_total"] = 0
+            episode_state["episode_cycles_total"] = 0
+
+        # Reset dur du streak (toujours, même si épisode pas ouvert)
+        episode_state["streak_count"] = 0
+        episode_state["streak_first_seen_at_utc"] = None
+        episode_state["streak_event_sum"] = 0
+
+
+def _process_cycle_notifications():
+    """Dispatch les notifications ntfy en fin de cycle.
+
+    Appelée APRÈS _process_cycle_events (qui a déjà écrit data_freeze /
+    data_freeze_recovered dans _current_cycle_events_buffer via _log_event).
+
+    Silencieux si :
+      - NTFY_TOPIC_URL n'est pas configuré dans l'environnement, OU
+      - config_ntfy.py n'a pas pu être importé (NTFY_NOTIFICATIONS vide)
+    """
+    if not _NTFY_TOPIC_URL or not NTFY_NOTIFICATIONS:
+        return
+
+    # Grouper les events du cycle par type
+    by_type = {}
+    for event in _current_cycle_events_buffer:
+        by_type.setdefault(event["type"], []).append(event)
+
+    # Charger l'état des épisodes (étendu dans le state freshness)
+    state = _load_freshness_state()
+    episode_states = state.get("episode_states", {})
+
+    for event_type, cfg in NTFY_NOTIFICATIONS.items():
+        if not cfg.get("enabled", False):
+            continue
+
+        events_this_cycle = by_type.get(event_type, [])
+        mode = cfg.get("mode", "immediate")
+
+        if mode == "immediate":
+            _notif_immediate(event_type, events_this_cycle, cfg)
+
+        elif mode == "batch_per_cycle":
+            _notif_batch(event_type, events_this_cycle, cfg)
+
+        elif mode == "episode":
+            episode_state = episode_states.setdefault(event_type, {
+                "streak_count": 0,
+                "streak_first_seen_at_utc": None,
+                "streak_event_sum": 0,
+                "episode_open": False,
+                "episode_start_at_utc": None,
+                "episode_events_total": 0,
+                "episode_cycles_total": 0,
+            })
+            _notif_episode(event_type, events_this_cycle, cfg, episode_state)
+
+    # Persister le state complet (avec episode_states mis à jour)
+    try:
+        _FRESHNESS_STATE_FILE.write_text(json.dumps({
+            "hashes": _last_flow_hash,
+            "consecutive_frozen": _consecutive_frozen,
+            "freeze_event_open": _freeze_event_open,
+            "first_frozen_at_utc": _first_frozen_at,
+            "episode_states": episode_states,
+        }))
+    except OSError:
+        pass
 
 
 def _apply_light_style(img):
@@ -396,7 +1067,7 @@ def _apply_light_style(img):
     return rgb.convert("RGBA")
 
 
-def download_base_image(lat, lon, zoom, width, height, api_key):
+def download_base_image(lat, lon, zoom, width, height, api_key, zone_name=None):
     """Télécharge la carte de base via l'API Static Image de TomTom."""
     w = min(width, 8192)
     h = min(height, 8192)
@@ -413,7 +1084,7 @@ def download_base_image(lat, lon, zoom, width, height, api_key):
         f"&language=de-DE"
     )
     print(f"  📍 Base map: {w}×{h} zoom={zoom} style={BASE_MAP_STYLE}")
-    data = api_get(url, binary=True)
+    data = api_get(url, binary=True, zone_name=zone_name, api_layer="base")
     if data:
         img = Image.open(BytesIO(data)).convert("RGBA")
         if img.size != (width, height):
@@ -439,11 +1110,14 @@ def resolve_road_types(zone_config, zoom):
     return ROAD_TYPES_BY_ZOOM.get(zoom, [0, 1, 2, 3])
 
 
-def download_vector_flow(lat, lon, zoom, width, height, api_key, road_types, tile_render_size=None):
+def download_vector_flow(lat, lon, zoom, width, height, api_key, road_types,
+                         tile_render_size=None, zone_name=None):
     """Télécharge et dessine les tuiles vectorielles de trafic flow (.pbf).
 
     road_types : liste d'indices de types de routes à capturer, résolue en amont
                  par resolve_road_types() (surcharge par zone ou fallback zoom).
+    zone_name  : si fourni, déclenche le contrôle de fraîcheur des données
+                 (détection de gel API TomTom).
     """
     if tile_render_size is None:
         tile_render_size = TILE_SIZE
@@ -461,6 +1135,9 @@ def download_vector_flow(lat, lon, zoom, width, height, api_key, road_types, til
     n_features = 0
     n_downloaded = 0
 
+    # Collecte des octets .pbf pour le contrôle de fraîcheur API
+    raw_tile_bytes = []
+
     for tile_x, tile_y, px_off, py_off in tiles:
         max_tile = 2 ** zoom - 1
         if tile_y < 0 or tile_y > max_tile:
@@ -475,10 +1152,11 @@ def download_vector_flow(lat, lon, zoom, width, height, api_key, road_types, til
             f"&tags=[road_type,traffic_level,road_closure]"
         )
 
-        data = api_get(url, binary=True)
+        data = api_get(url, binary=True, zone_name=zone_name, api_layer="flow")
         if not data:
             continue
         n_downloaded += 1
+        raw_tile_bytes.append(data)
 
         features = parse_mvt_tile(data)
 
@@ -523,19 +1201,41 @@ def download_vector_flow(lat, lon, zoom, width, height, api_key, road_types, til
                     draw.line(shifted, fill=outline_color, width=vis_outline, joint="curve")
                     draw.line(shifted, fill=main_color, width=vis_main, joint="curve")
 
+    # Contrôle de fraîcheur — alerte si l'API TomTom sert des données gelées
+    if zone_name:
+        _check_data_freshness(zone_name, raw_tile_bytes)
+
+    # Événement structuré si des tuiles ont manqué
+    if zone_name and n_downloaded < n_tiles:
+        _log_event(
+            event_type="partial_capture",
+            zone=zone_name,
+            severity="warning",
+            details={
+                "api_layer": "flow",
+                "downloaded": n_downloaded,
+                "expected": n_tiles,
+                "missing": n_tiles - n_downloaded,
+            },
+        )
+
     print(f"  🚗 Flow: {n_downloaded}/{n_tiles} tuiles, {n_features} segments"
           f" (roadTypes={road_types})")
     return flow_img
 
 
 def download_incidents(lat, lon, zoom, width, height, api_key,
-                       tile_render_size=None, collect_annotations=False):
+                       tile_render_size=None, collect_annotations=False,
+                       zone_name=None):
     """
     Télécharge les incidents via Vector Incident Tiles (.pbf) et les dessine.
 
     Si collect_annotations=True, retourne (image, annotations_list) où
     annotations_list contient les données nécessaires pour dessiner les badges.
     Sinon, retourne (image, []).
+
+    zone_name : si fourni, utilisé pour le contexte des événements loggés
+                (timeouts, HTTP errors, partial captures).
     """
     if tile_render_size is None:
         tile_render_size = TILE_SIZE
@@ -566,7 +1266,7 @@ def download_incidents(lat, lon, zoom, width, height, api_key,
             f"&tags=[icon_category,magnitude,road_type,delay,id]"
         )
 
-        data = api_get(url, binary=True)
+        data = api_get(url, binary=True, zone_name=zone_name, api_layer="incidents")
         if not data:
             continue
         n_downloaded += 1
@@ -713,6 +1413,20 @@ def download_incidents(lat, lon, zoom, width, height, api_key,
 
     if collect_annotations and annotations:
         print(f"  🏷 Annotations: {len(annotations)} incidents à annoter")
+
+    # Événement structuré si des tuiles ont manqué
+    if zone_name and n_downloaded < n_tiles:
+        _log_event(
+            event_type="partial_capture",
+            zone=zone_name,
+            severity="warning",
+            details={
+                "api_layer": "incidents",
+                "downloaded": n_downloaded,
+                "expected": n_tiles,
+                "missing": n_tiles - n_downloaded,
+            },
+        )
 
     return inc_img, annotations
 
@@ -1046,7 +1760,10 @@ def capture_zone(zone_name, zone_config, api_key, now):
         print(f"  📦 Base map: cache OK")
         base_img = Image.open(cache_path).convert("RGBA")
     else:
-        base_img = download_base_image(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, api_key)
+        base_img = download_base_image(
+            lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, api_key,
+            zone_name=zone_name,
+        )
         if base_img is None:
             print(f"  ✗ Impossible de télécharger la carte de base")
             return 0
@@ -1060,7 +1777,8 @@ def capture_zone(zone_name, zone_config, api_key, now):
     # 2. Traffic Flow
     flow_img = download_vector_flow(
         lat, lon, zoom, render_w, render_h, api_key, road_types,
-        tile_render_size=tile_render_size
+        tile_render_size=tile_render_size,
+        zone_name=zone_name,
     )
 
     # 3. Incidents (+ collecte des annotations si activé)
@@ -1070,6 +1788,7 @@ def capture_zone(zone_name, zone_config, api_key, now):
             lat, lon, zoom, render_w, render_h, api_key,
             tile_render_size=tile_render_size,
             collect_annotations=want_annotations,
+            zone_name=zone_name,
         )
     else:
         inc_img = Image.new("RGBA", (render_w, render_h), (0, 0, 0, 0))
@@ -1118,7 +1837,10 @@ def save_bases(api_key):
         lat, lon, zoom = parse_zone_url(zone_url)
         print(f"\n[{zone_name}] zoom={zoom}")
 
-        base_img = download_base_image(lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, api_key)
+        base_img = download_base_image(
+            lat, lon, zoom, VIEWPORT_WIDTH, VIEWPORT_HEIGHT, api_key,
+            zone_name=zone_name,
+        )
         if base_img is None:
             print(f"  ✗ Échec téléchargement base")
             continue
@@ -1247,6 +1969,11 @@ if __name__ == "__main__":
     now = datetime.now(TIMEZONE)
     print(f"═══ TomTom Vector Flow Capture — {now.strftime('%Y-%m-%d %H:%M %Z')} ═══")
 
+    # Setter le contexte pour le journal d'événements
+    # (toutes les fonctions qui appellent _log_event() l'utilisent)
+    _current_date_str = now.strftime("%Y-%m-%d")
+    _current_local_time = now.strftime("%H:%M")
+
     # Afficher les zones configurées
     print("\nZones configurées:")
     for name, zone_config in ZONES.items():
@@ -1273,6 +2000,29 @@ if __name__ == "__main__":
                 import traceback
                 traceback.print_exc()
                 errors += 1
+                _log_event(
+                    event_type="zone_capture_failed",
+                    zone=zone_name,
+                    severity="error",
+                    details={
+                        "exception_type": type(e).__name__,
+                        "message": str(e)[:300],
+                    },
+                )
+
+        # Évaluer le gel global après traitement de toutes les zones
+        # (règle ≥ 50% → émet data_freeze / data_freeze_recovered dans le log)
+        try:
+            _process_cycle_events(list(ZONES.keys()))
+        except Exception as e:
+            print(f"⚠ Échec évaluation gel global : {e}")
+
+        # Dispatch des notifications ntfy
+        # (silencieux si NTFY_TOPIC_URL absent ou config_ntfy.py non importé)
+        try:
+            _process_cycle_notifications()
+        except Exception as e:
+            print(f"⚠ Échec dispatch ntfy : {e}")
 
         print(f"\n{'═'*60}")
         print(f"Résumé: {len(ZONES) - errors}/{len(ZONES)} zones OK")
