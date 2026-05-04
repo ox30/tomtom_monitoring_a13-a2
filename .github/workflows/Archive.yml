@@ -51,7 +51,9 @@ jobs:
           du -sh captures/${{ env.DATE }}/
 
           # Compter zones et images
-          ZONES=$(ls captures/${{ env.DATE }}/ | wc -l)
+          # Note : on filtre sur les répertoires (-type d) pour exclure
+          # capture_errors.json qui vit à côté des dossiers de zones.
+          ZONES=$(find captures/${{ env.DATE }}/ -mindepth 1 -maxdepth 1 -type d | wc -l)
           IMAGES=$(find captures/${{ env.DATE }}/ -name "*.jpg" | wc -l)
           echo "ZONES=${ZONES}" >> $GITHUB_ENV
           echo "IMAGES=${IMAGES}" >> $GITHUB_ENV
@@ -185,3 +187,43 @@ jobs:
           echo "   Destination : proton:A13-A2/"
           echo "   Déclencheur : ${{ github.event_name }}"
           echo "════════════════════════════════════════"
+
+      - name: Notification ntfy (succès)
+        env:
+          NTFY_TOPIC_URL: ${{ secrets.NTFY_TOPIC_URL }}
+        run: |
+          if [ -z "$NTFY_TOPIC_URL" ]; then
+            echo "→ NTFY_TOPIC_URL non configuré — notif skipped"
+            exit 0
+          fi
+          BODY="Date : ${{ env.DATE }}
+          Zones : ${{ env.ZONES }}
+          Images : ${{ env.IMAGES }}
+          Taille ZIP : ${{ env.ZIP_SIZE }}
+          Verifie : ${{ env.VERIFIED }}
+          Trigger : ${{ github.event_name }}"
+          curl -s \
+            -H "Title: Archivage Proton OK" \
+            -H "Priority: 2" \
+            -H "Tags: white_check_mark,floppy_disk" \
+            -d "$BODY" \
+            "$NTFY_TOPIC_URL" || true
+
+      - name: Notification ntfy (échec)
+        if: failure()
+        env:
+          NTFY_TOPIC_URL: ${{ secrets.NTFY_TOPIC_URL }}
+        run: |
+          if [ -z "$NTFY_TOPIC_URL" ]; then
+            exit 0
+          fi
+          BODY="Date : ${{ env.DATE || 'inconnue' }}
+          Trigger : ${{ github.event_name }}
+          Run : ${{ github.run_id }}
+          Voir : https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s \
+            -H "Title: Archivage Proton ECHEC" \
+            -H "Priority: 4" \
+            -H "Tags: rotating_light" \
+            -d "$BODY" \
+            "$NTFY_TOPIC_URL" || true
