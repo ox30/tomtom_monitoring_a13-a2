@@ -73,6 +73,7 @@ jobs:
       - name: Boucle de capture
         env:
           TOMTOM_API_KEY: ${{ secrets.TOMTOM_API_KEY }}
+          NTFY_TOPIC_URL: ${{ secrets.NTFY_TOPIC_URL }}
           INTERVAL_SEC: ${{ github.event.inputs.interval || '600' }}
           MAX_CYCLES: ${{ github.event.inputs.cycles || '0' }}
           INCIDENTS_ENABLED: ${{ github.event.inputs.incidents || 'true' }}
