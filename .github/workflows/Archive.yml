@@ -86,6 +86,7 @@ jobs:
             rclone copy /tmp/captures-${{ env.DATE }}.zip proton:A13-A2/ \
               --progress --stats-one-line
             echo "✅ Archivé sur Proton Drive"
+            echo "ARCHIVE_ACTION=uploaded" >> $GITHUB_ENV
           elif [ "$REMOTE_SIZE" != "$LOCAL_SIZE" ]; then
             echo "⚠ Fichier existant incomplet ou différent (local=${LOCAL_SIZE} / remote=${REMOTE_SIZE})"
             echo "🗑 Suppression de l'ancien fichier..."
@@ -94,8 +95,11 @@ jobs:
             rclone copy /tmp/captures-${{ env.DATE }}.zip proton:A13-A2/ \
               --progress --stats-one-line
             echo "✅ Fichier remplacé sur Proton Drive"
+            echo "ARCHIVE_ACTION=replaced" >> $GITHUB_ENV
+            echo "OLD_REMOTE_SIZE=${REMOTE_SIZE}" >> $GITHUB_ENV
           else
             echo "✓ Fichier identique déjà présent (${LOCAL_SIZE} bytes) — skip"
+            echo "ARCHIVE_ACTION=skipped" >> $GITHUB_ENV
           fi
 
       - name: Vérifier l'upload
@@ -188,6 +192,17 @@ jobs:
           echo "   Déclencheur : ${{ github.event_name }}"
           echo "════════════════════════════════════════"
 
+      - name: Détecter échec d'upload
+        run: |
+          if [ "${{ env.VERIFIED }}" != "true" ]; then
+            echo "❌ Vérification d'upload échouée (VERIFIED=${{ env.VERIFIED }})"
+            echo "   → fait planter le job pour déclencher la notif d'échec."
+            echo "   → rattrapage manuel : Actions > Archive to Proton Drive > Run workflow"
+            echo "                         avec date=${{ env.DATE }}"
+            exit 1
+          fi
+          echo "✓ Upload vérifié, action=${{ env.ARCHIVE_ACTION }}"
+
       - name: Notification ntfy (succès)
         env:
           NTFY_TOPIC_URL: ${{ secrets.NTFY_TOPIC_URL }}
@@ -196,16 +211,43 @@ jobs:
             echo "→ NTFY_TOPIC_URL non configuré — notif skipped"
             exit 0
           fi
+          case "${{ env.ARCHIVE_ACTION }}" in
+            uploaded)
+              TITLE="Archivage Proton OK"
+              PRIORITY="2"
+              TAGS="white_check_mark,floppy_disk"
+              ACTION_LINE="Action : nouveau fichier upload"
+              ;;
+            replaced)
+              TITLE="Archivage Proton - fichier remplace"
+              PRIORITY="2"
+              TAGS="warning,floppy_disk"
+              ACTION_LINE="Action : remplace (ancien fichier ${{ env.OLD_REMOTE_SIZE }} bytes, incomplet ou different)"
+              ;;
+            skipped)
+              TITLE="Archivage Proton - deja a jour"
+              PRIORITY="1"
+              TAGS="information_source"
+              ACTION_LINE="Action : skip (fichier identique deja present)"
+              ;;
+            *)
+              TITLE="Archivage Proton OK"
+              PRIORITY="2"
+              TAGS="white_check_mark"
+              ACTION_LINE="Action : inconnue"
+              ;;
+          esac
           BODY="Date : ${{ env.DATE }}
           Zones : ${{ env.ZONES }}
           Images : ${{ env.IMAGES }}
           Taille ZIP : ${{ env.ZIP_SIZE }}
           Verifie : ${{ env.VERIFIED }}
-          Trigger : ${{ github.event_name }}"
+          Trigger : ${{ github.event_name }}
+          ${ACTION_LINE}"
           curl -s \
-            -H "Title: Archivage Proton OK" \
-            -H "Priority: 2" \
-            -H "Tags: white_check_mark,floppy_disk" \
+            -H "Title: ${TITLE}" \
+            -H "Priority: ${PRIORITY}" \
+            -H "Tags: ${TAGS}" \
             -d "$BODY" \
             "$NTFY_TOPIC_URL" || true
 
@@ -218,9 +260,14 @@ jobs:
             exit 0
           fi
           BODY="Date : ${{ env.DATE || 'inconnue' }}
+          Verifie : ${{ env.VERIFIED || 'inconnu' }}
+          Action tentee : ${{ env.ARCHIVE_ACTION || 'inconnue' }}
           Trigger : ${{ github.event_name }}
           Run : ${{ github.run_id }}
-          Voir : https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          Voir : https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Rattrapage manuel : Actions > Archive to Proton Drive > Run workflow > date=${{ env.DATE }}"
           curl -s \
             -H "Title: Archivage Proton ECHEC" \
             -H "Priority: 4" \
