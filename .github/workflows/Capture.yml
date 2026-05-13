@@ -53,6 +53,7 @@ jobs:
           # Copier ce dont on a besoin hors du repo
           cp capture.py /tmp/capture.py
           cp config.py /tmp/config.py
+          cp incidents_export.py /tmp/incidents_export.py 2>/dev/null || true
           cp requirements.txt /tmp/requirements.txt 2>/dev/null || true
 
       - name: Restaurer les données existantes
@@ -104,6 +105,7 @@ jobs:
           # Restaurer UNIQUEMENT ce qu'on veut sur la branche captures
           cp /tmp/capture.py capture.py
           cp /tmp/config.py config.py
+          cp /tmp/incidents_export.py incidents_export.py 2>/dev/null || true
           cp -r /tmp/captures captures 2>/dev/null || mkdir -p captures
           cp -r /tmp/bases bases 2>/dev/null || mkdir -p bases
 
