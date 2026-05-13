@@ -27,6 +27,16 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFont
 # ─── Import configuration ────────────────────────────────────────────────────
 from config import *
 
+# Export structuré des incidents (v14 préparatoire) — génère incidents_{date}.json
+# en parallèle des images. Import optionnel : si le module est absent, le système
+# continue à produire les images normalement.
+try:
+    import incidents_export as inc_export
+    INCIDENTS_EXPORT_ENABLED = True
+except ImportError:
+    inc_export = None
+    INCIDENTS_EXPORT_ENABLED = False
+
 # Notifications ntfy — import optionnel. Si config_ntfy.py absent ou mal formé,
 # le système continue sans notifs (les events restent loggés dans le JSON).
 try:
@@ -1226,13 +1236,18 @@ def download_vector_flow(lat, lon, zoom, width, height, api_key, road_types,
 
 def download_incidents(lat, lon, zoom, width, height, api_key,
                        tile_render_size=None, collect_annotations=False,
-                       zone_name=None):
+                       zone_name=None, collect_structured=False):
     """
     Télécharge les incidents via Vector Incident Tiles (.pbf) et les dessine.
 
     Si collect_annotations=True, retourne (image, annotations_list) où
     annotations_list contient les données nécessaires pour dessiner les badges.
     Sinon, retourne (image, []).
+
+    Si collect_structured=True, retourne (image, annotations_list, structured_list)
+    où structured_list contient un dict par incident unique (dédupliqué par
+    tomtom_id) avec la polyline reprojetée en WGS84, prêt pour le fichier JSON
+    d'export utilisé par l'onglet Analyse (v14).
 
     zone_name : si fourni, utilisé pour le contexte des événements loggés
                 (timeouts, HTTP errors, partial captures).
@@ -1253,6 +1268,11 @@ def download_incidents(lat, lon, zoom, width, height, api_key,
     # Phase 1 : Collecter tous les incidents
     all_incidents = []
 
+    # Pour l'export structuré : dict {tomtom_id → record}, on garde la polyline
+    # la plus longue par tomtom_id (heuristique pragmatique pour la dédup
+    # inter-tuiles). La dédup inter-zones est faite plus tard.
+    structured_by_id = {} if (collect_structured and INCIDENTS_EXPORT_ENABLED) else None
+
     for tile_x, tile_y, px_off, py_off in tiles:
         max_tile = 2 ** zoom - 1
         if tile_y < 0 or tile_y > max_tile:
@@ -1263,7 +1283,9 @@ def download_incidents(lat, lon, zoom, width, height, api_key,
             f"https://api.tomtom.com/traffic/map/4/tile/incidents"
             f"/{zoom}/{tx}/{tile_y}.pbf"
             f"?key={api_key}"
-            f"&tags=[icon_category,magnitude,road_type,delay,id]"
+            f"&tags=[icon_category,description,magnitude,road_type,delay,id,"
+            f"end_date,last_report_time,road_category,road_subcategory,"
+            f"traffic_road_coverage,probability_of_occurrence,number_of_reports,clustered]"
         )
 
         data = api_get(url, binary=True, zone_name=zone_name, api_layer="incidents")
@@ -1339,6 +1361,27 @@ def download_incidents(lat, lon, zoom, width, height, api_key,
 
                 all_incidents.append((priority, style, icon_cat, magnitude,
                                       outline_w, main_w, coords, delay, incident_id))
+
+                # Collecte structurée pour l'export JSON (v14 préparatoire) —
+                # On reprojette en lat/lon directement depuis les coords MVT brutes,
+                # plus précis que de passer par les pixels d'image arrondis.
+                if structured_by_id is not None and incident_id is not None:
+                    polyline_latlon = inc_export.reproject_mvt_polyline(
+                        line, tile_x, tile_y, zoom, extent,
+                    )
+                    if len(polyline_latlon) >= 2:
+                        existing = structured_by_id.get(incident_id)
+                        if existing is None or len(polyline_latlon) > len(existing["polyline_latlon"]):
+                            extended_tags = inc_export.extract_extended_tags(tags)
+                            structured_by_id[incident_id] = inc_export.build_incident_record(
+                                tomtom_id=incident_id,
+                                icon_cat=icon_cat,
+                                magnitude=magnitude,
+                                delay=delay,
+                                road_type=road_type,
+                                polyline_latlon=polyline_latlon,
+                                **extended_tags,
+                            )
 
     # Phase 2 : Trier par priorité
     all_incidents.sort(key=lambda x: x[0])
@@ -1428,6 +1471,9 @@ def download_incidents(lat, lon, zoom, width, height, api_key,
             },
         )
 
+    if collect_structured:
+        structured_list = list(structured_by_id.values()) if structured_by_id else []
+        return inc_img, annotations, structured_list
     return inc_img, annotations
 
 
@@ -1783,13 +1829,23 @@ def capture_zone(zone_name, zone_config, api_key, now):
 
     # 3. Incidents (+ collecte des annotations si activé)
     annotations = []
+    structured_incidents = []
     if INCIDENTS_ENABLED:
-        inc_img, annotations = download_incidents(
-            lat, lon, zoom, render_w, render_h, api_key,
-            tile_render_size=tile_render_size,
-            collect_annotations=want_annotations,
-            zone_name=zone_name,
-        )
+        if INCIDENTS_EXPORT_ENABLED:
+            inc_img, annotations, structured_incidents = download_incidents(
+                lat, lon, zoom, render_w, render_h, api_key,
+                tile_render_size=tile_render_size,
+                collect_annotations=want_annotations,
+                zone_name=zone_name,
+                collect_structured=True,
+            )
+        else:
+            inc_img, annotations = download_incidents(
+                lat, lon, zoom, render_w, render_h, api_key,
+                tile_render_size=tile_render_size,
+                collect_annotations=want_annotations,
+                zone_name=zone_name,
+            )
     else:
         inc_img = Image.new("RGBA", (render_w, render_h), (0, 0, 0, 0))
         print(f"  ⚠ Incidents désactivés (INCIDENTS_ENABLED=false)")
@@ -1817,7 +1873,7 @@ def capture_zone(zone_name, zone_config, api_key, now):
     size_kb = out_path.stat().st_size / 1024
     print(f"  ✅ {out_path} ({size_kb:.0f} KB) — JPEG q={OUTPUT_QUALITY}")
 
-    return counter
+    return structured_incidents
 
 
 def save_bases(api_key):
@@ -1991,10 +2047,14 @@ if __name__ == "__main__":
     else:
         counter = 0
         errors = 0
+        # Collecte par zone des incidents structurés du cycle courant (v14)
+        cycle_records_by_zone = {}
 
         for zone_name, zone_config in ZONES.items():
             try:
-                capture_zone(zone_name, zone_config, api_key, now)
+                zone_records = capture_zone(zone_name, zone_config, api_key, now)
+                if zone_records:
+                    cycle_records_by_zone[zone_name] = zone_records
             except Exception as e:
                 print(f"[{zone_name}] ✗ Erreur: {e}")
                 import traceback
@@ -2009,6 +2069,31 @@ if __name__ == "__main__":
                         "message": str(e)[:300],
                     },
                 )
+
+        # Export JSON des incidents du cycle (v14 préparatoire)
+        # Toujours appelé même si cycle_records_by_zone est vide : on veut une
+        # entrée "incidents: []" pour matérialiser le cycle dans le fichier.
+        if INCIDENTS_EXPORT_ENABLED and INCIDENTS_ENABLED:
+            try:
+                date_str = now.strftime("%Y-%m-%d")
+                cycle_key = now.strftime("%H%M")
+                datetime_utc = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                n_inc, n_zones = inc_export.save_cycle_to_day_file(
+                    date_str=date_str,
+                    zones=list(ZONES.keys()),
+                    cycle_key=cycle_key,
+                    datetime_utc=datetime_utc,
+                    cycle_records_by_zone=cycle_records_by_zone,
+                    output_dir=OUTPUT_DIR,
+                )
+                print(f"\n📊 Export incidents JSON : {n_inc} incidents uniques "
+                      f"({n_zones}/{len(ZONES)} zones avec data) "
+                      f"→ {OUTPUT_DIR}/{date_str}/incidents_{date_str}.json")
+            except Exception as e:
+                # On ne fait pas planter le run pour ça — les images sont déjà sauvées
+                print(f"⚠ Échec export JSON incidents : {e}")
+                import traceback
+                traceback.print_exc()
 
         # Évaluer le gel global après traitement de toutes les zones
         # (règle ≥ 50% → émet data_freeze / data_freeze_recovered dans le log)
