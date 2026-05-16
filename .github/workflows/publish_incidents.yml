@@ -1,0 +1,227 @@
+name: Publish Incidents to monitoring-stats
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Publie le fichier incidents_<J-1>.json (produit par Capture.yml sur la
+# branche `captures`) vers la branche orpheline `incidents-data` du repo
+# `monitoring-stats`.
+#
+# Pattern multi-cron (4 déclenchements/jour) avec skip silencieux si le
+# fichier est déjà publié avec une taille identique. ntfy uniquement sur
+# succès réel (1er push) ou échec.
+#
+# Prérequis (secrets) :
+# - MONITORING_STATS_PUSH_TOKEN : Fine-grained PAT avec Contents:write sur
+#                                 le repo `monitoring-stats`
+# - NTFY_TOPIC_URL_STATS         : URL https://ntfy.sh/<topic> dédié stats
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    # 4 tentatives/jour pour pallier les retards GitHub Actions.
+    # Espacement >= 4h pour éviter les collisions entre runs.
+    - cron: '30 2,6,10,14 * * *'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Date à publier (AAAA-MM-DD, vide = J-1)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-incidents
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      # ─── 1. Date cible ────────────────────────────────────────────────────
+      - name: Date cible
+        run: |
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            DATE="${{ github.event.inputs.date }}"
+          else
+            DATE=$(date -u -d "yesterday" +%Y-%m-%d)
+          fi
+          echo "DATE=${DATE}" >> $GITHUB_ENV
+          echo "📅 Date cible : ${DATE}"
+
+      # ─── 2. Récupérer le JSON source depuis branche `captures` ────────────
+      - name: Récupérer incidents_<DATE>.json depuis branche captures
+        id: fetch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          URL="https://raw.githubusercontent.com/${{ github.repository }}/captures/captures/${DATE}/incidents_${DATE}.json"
+          HTTP_CODE=$(curl -sL -o /tmp/incidents.json \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -w "%{http_code}" "$URL" || echo "000")
+
+          if [ "$HTTP_CODE" != "200" ] || [ ! -s /tmp/incidents.json ]; then
+            echo "⚠ Fichier source absent ou inaccessible (HTTP $HTTP_CODE)"
+            echo "   URL : $URL"
+            echo "SOURCE_MISSING=true" >> $GITHUB_ENV
+            # Pas d'erreur : le multi-cron retentera. On évite de spammer ntfy.
+            exit 0
+          fi
+
+          LOCAL_SIZE=$(stat --format=%s /tmp/incidents.json)
+          echo "LOCAL_SIZE=${LOCAL_SIZE}" >> $GITHUB_ENV
+          echo "✓ Fichier récupéré (${LOCAL_SIZE} bytes)"
+
+      # ─── 3. Vérifier l'état de la branche `incidents-data` ────────────────
+      - name: Vérifier état branche incidents-data
+        if: env.SOURCE_MISSING != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.MONITORING_STATS_PUSH_TOKEN }}
+        run: |
+          BRANCH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/repos/ox30/monitoring-stats/branches/incidents-data")
+          echo "BRANCH_STATUS=${BRANCH_STATUS}"
+
+          if [ "$BRANCH_STATUS" = "200" ]; then
+            EXISTING=$(curl -s -H "Authorization: token ${GH_TOKEN}" \
+              "https://api.github.com/repos/ox30/monitoring-stats/contents/incidents_${DATE}.json?ref=incidents-data")
+            REMOTE_SIZE=$(echo "$EXISTING" | python3 -c "
+          import sys, json
+          try:
+              d = json.load(sys.stdin)
+              print(d.get('size', 0) if isinstance(d, dict) and 'size' in d else 0)
+          except Exception:
+              print(0)
+          ")
+            echo "REMOTE_SIZE=${REMOTE_SIZE}" >> $GITHUB_ENV
+            echo "✓ Branche existante — fichier remote = ${REMOTE_SIZE} bytes"
+          else
+            echo "REMOTE_SIZE=0" >> $GITHUB_ENV
+            echo "ℹ Branche incidents-data inexistante — sera créée au 1er push"
+          fi
+
+      # ─── 4. Skip silencieux si déjà publié ────────────────────────────────
+      - name: Skip si déjà publié (taille identique)
+        if: env.SOURCE_MISSING != 'true' && env.LOCAL_SIZE == env.REMOTE_SIZE
+        run: |
+          echo "✓ Fichier déjà publié avec taille identique (${LOCAL_SIZE} bytes) — skip silencieux"
+          echo "SKIPPED=true" >> $GITHUB_ENV
+
+      # ─── 5. Cloner monitoring-stats ───────────────────────────────────────
+      - name: Cloner monitoring-stats
+        if: env.SOURCE_MISSING != 'true' && env.SKIPPED != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.MONITORING_STATS_PUSH_TOKEN }}
+        run: |
+          git clone --depth 1 \
+            https://x-access-token:${GH_TOKEN}@github.com/ox30/monitoring-stats.git \
+            /tmp/ms 2>&1 | sed 's/${GH_TOKEN}/***/g'
+          cd /tmp/ms
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Vérifier l'existence de la branche orpheline
+          if git ls-remote --heads origin incidents-data | grep -q incidents-data; then
+            echo "✓ Branche incidents-data existe — checkout"
+            git fetch origin incidents-data:incidents-data
+            git checkout incidents-data
+          else
+            echo "🌱 Création de la branche orpheline incidents-data"
+            git checkout --orphan incidents-data
+            git rm -rf . 2>/dev/null || true
+            # README initial à la racine de la branche
+            cat > README.md << 'README_EOF'
+          # incidents-data
+
+          Branche orpheline contenant les fichiers `incidents_AAAA-MM-DD.json`
+          produits par la capture du système `tomtom_monitoring_a13-a2`.
+
+          - **Source** : workflow `publish_incidents.yml` du repo de capture.
+          - **Mise à jour** : 4 fois/jour, push uniquement si nouveau ou
+            si la taille change.
+          - **Purge** : workflow `purge_incidents.yml` archive vers Proton Drive
+            quand la branche dépasse 4 GB cumulés.
+
+          Voir `archive_log.json` pour la liste des jours archivés sur Proton.
+
+          Ne pas commiter manuellement sur cette branche.
+          README_EOF
+            git add README.md
+            git commit -m "🌱 Initial commit — incidents-data orphan branch"
+          fi
+
+      # ─── 6. Push du JSON ──────────────────────────────────────────────────
+      - name: Pousser incidents_<DATE>.json
+        if: env.SOURCE_MISSING != 'true' && env.SKIPPED != 'true'
+        run: |
+          cd /tmp/ms
+          cp /tmp/incidents.json incidents_${DATE}.json
+          git add incidents_${DATE}.json
+
+          if git diff --cached --quiet; then
+            echo "⚠ Aucun changement après stage — état inattendu, abort"
+            echo "SKIPPED=true" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          git commit -m "📊 Publish incidents_${DATE}.json (${LOCAL_SIZE} bytes)"
+
+          # Retry push (2 tentatives, gère les races concurrentes)
+          PUSHED=false
+          for i in 1 2; do
+            if git push origin incidents-data; then
+              echo "✓ Push réussi (tentative $i/2)"
+              PUSHED=true
+              break
+            else
+              echo "⚠ Push échoué (tentative $i/2) — pull rebase + retry dans 10s"
+              git pull --rebase origin incidents-data 2>/dev/null || true
+              sleep 10
+            fi
+          done
+
+          if [ "$PUSHED" != "true" ]; then
+            echo "❌ Push impossible après 2 tentatives"
+            exit 1
+          fi
+
+      # ─── 7. Nettoyage clone ───────────────────────────────────────────────
+      - name: Cleanup
+        if: always()
+        run: rm -rf /tmp/ms /tmp/incidents.json
+
+      # ─── 8. Notification ntfy (succès — seulement si push réel) ───────────
+      - name: Notif ntfy (succès)
+        if: env.SOURCE_MISSING != 'true' && env.SKIPPED != 'true'
+        env:
+          NTFY: ${{ secrets.NTFY_TOPIC_URL_STATS }}
+        run: |
+          if [ -z "$NTFY" ]; then exit 0; fi
+          BODY="Date : ${DATE}
+          Taille : ${LOCAL_SIZE} bytes
+          Branche : incidents-data
+          Trigger : ${{ github.event_name }}"
+          curl -s \
+            -H "Title: Publish incidents OK" \
+            -H "Priority: 2" \
+            -H "Tags: white_check_mark,outbox_tray" \
+            -d "$BODY" \
+            "$NTFY" || true
+
+      # ─── 9. Notification ntfy (échec) ─────────────────────────────────────
+      - name: Notif ntfy (échec)
+        if: failure()
+        env:
+          NTFY: ${{ secrets.NTFY_TOPIC_URL_STATS }}
+        run: |
+          if [ -z "$NTFY" ]; then exit 0; fi
+          BODY="Date : ${DATE:-inconnue}
+          Trigger : ${{ github.event_name }}
+          Run : https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s \
+            -H "Title: Publish incidents ECHEC" \
+            -H "Priority: 4" \
+            -H "Tags: rotating_light" \
+            -d "$BODY" \
+            "$NTFY" || true
