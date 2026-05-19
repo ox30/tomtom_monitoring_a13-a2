@@ -229,6 +229,12 @@ INCIDENT_VIS_MAIN    = 0.6
 # ─── Activation incidents ─────────────────────────────────────────────────────
 INCIDENTS_ENABLED = os.environ.get("INCIDENTS_ENABLED", "true").lower() != "false"
 
+# ─── Verbosité des logs ───────────────────────────────────────────────────────
+# VERBOSE_LOGS=1 → affiche : bloc BUDGET API détaillé, coordonnées GPS par zone,
+#                            liste détaillée des zones au démarrage
+# VERBOSE_LOGS=0 (défaut) → résumé minimal (utile pour logs publics)
+VERBOSE_LOGS = os.environ.get("VERBOSE_LOGS", "0") == "1"
+
 # ─── Budget API ───────────────────────────────────────────────────────────────
 DAILY_QUOTA    = 50_000   # Requêtes gratuites TomTom par jour
 CYCLES_PER_RUN = 36       # 6h / 10 min

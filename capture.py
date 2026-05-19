@@ -1784,9 +1784,12 @@ def capture_zone(zone_name, zone_config, api_key, now):
     rt_source = "override zone" if "road_types_override" in zone_config else f"fallback zoom {zoom}"
 
     print(f"\n{'─'*60}")
-    print(f"[{zone_name}] lat={lat} lon={lon} zoom={zoom}"
-          f" annotations={'ON' if want_annotations else 'OFF'}")
-    print(f"  📋 roadTypes flow={road_types} ({rt_source})")
+    if VERBOSE_LOGS:
+        print(f"[{zone_name}] lat={lat} lon={lon} zoom={zoom}"
+              f" annotations={'ON' if want_annotations else 'OFF'}")
+        print(f"  📋 roadTypes flow={road_types} ({rt_source})")
+    else:
+        print(f"[{zone_name}] zoom={zoom}")
 
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H%M")
@@ -1952,6 +1955,9 @@ def _count_tiles_for_zone(lat, lon, zoom):
 
 def print_budget_report():
     """Affiche le rapport de consommation API estimée."""
+    if not VERBOSE_LOGS:
+        # Mode silencieux par défaut. Pour voir le détail : VERBOSE_LOGS=1
+        return
     print(f"\n{'─'*65}")
     print("📊 BUDGET API — Estimation de consommation")
     print(f"{'─'*65}")
@@ -2030,14 +2036,17 @@ if __name__ == "__main__":
     _current_date_str = now.strftime("%Y-%m-%d")
     _current_local_time = now.strftime("%H:%M")
 
-    # Afficher les zones configurées
-    print("\nZones configurées:")
-    for name, zone_config in ZONES.items():
-        lat, lon, zoom = parse_zone_url(zone_config["url"])
-        road_types = resolve_road_types(zone_config, zoom)
-        ann = "✓" if zone_config.get("annotations", False) else "X"
-        override_tag = " (override)" if "road_types_override" in zone_config else ""
-        print(f"  ✓ {name}: zoom={zoom} roadTypes={road_types}{override_tag} annotations={ann}")
+    # Afficher les zones configurées (détaillé si VERBOSE_LOGS=1)
+    if VERBOSE_LOGS:
+        print("\nZones configurées:")
+        for name, zone_config in ZONES.items():
+            lat, lon, zoom = parse_zone_url(zone_config["url"])
+            road_types = resolve_road_types(zone_config, zoom)
+            ann = "✓" if zone_config.get("annotations", False) else "X"
+            override_tag = " (override)" if "road_types_override" in zone_config else ""
+            print(f"  ✓ {name}: zoom={zoom} roadTypes={road_types}{override_tag} annotations={ann}")
+    else:
+        print(f"\n→ {len(ZONES)} zones configurées (VERBOSE_LOGS=1 pour détails)")
 
     print_budget_report()
     clear_stale_cache()
