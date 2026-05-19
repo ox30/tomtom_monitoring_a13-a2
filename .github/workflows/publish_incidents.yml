@@ -1,20 +1,19 @@
-name: Publish Incidents to monitoring-stats
+name: Publish Incidents (incidents-data branch)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Publie le fichier incidents_<J-1>.json (produit par Capture.yml sur la
-# branche `captures`) vers la branche orpheline `incidents-data` du repo
-# `monitoring-stats`, et maintient à jour un `index.json` listant tous les
-# jours disponibles (utilisé par le front pour le sélecteur de période v15).
+# Publie le fichier incidents_<J-1>.json depuis le repo PRIVÉ tomtom-data-prod
+# branche `captures-prod` vers la branche orpheline `incidents-data` du MÊME
+# repo privé. Maintient à jour `index.json` listant tous les jours disponibles
+# (utilisé par monitoring-stats v15 via proxy authentifié).
 #
 # Pattern multi-cron (4 déclenchements/jour) :
-#  - Si le JSON J-1 est déjà publié avec taille identique → skip côté publish
+#  - Si le JSON J-1 est déjà publié avec taille identique → skip publish
 #    mais on régénère quand même `index.json` (cas migration ou refresh)
 #  - ntfy uniquement sur succès réel (push effectif) ou échec
 #
-# Prérequis (secrets) :
-# - MONITORING_STATS_PUSH_TOKEN : Fine-grained PAT avec Contents:write sur
-#                                 le repo `monitoring-stats`
-# - NTFY_TOPIC_URL_STATS         : URL https://ntfy.sh/<topic> dédié stats
+# Prérequis secrets :
+# - DATA_REPO_TOKEN       : Fine-grained PAT Contents:write sur tomtom-data-prod
+# - NTFY_TOPIC_URL_STATS  : URL https://ntfy.sh/<topic> dédié stats (optionnel)
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -39,6 +38,11 @@ concurrency:
   group: publish-incidents
   cancel-in-progress: false
 
+env:
+  DATA_REPO: ox30/tomtom-data-prod
+  SOURCE_BRANCH: captures-prod
+  TARGET_BRANCH: incidents-data
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -59,15 +63,15 @@ jobs:
             echo "📅 Date cible : ${DATE}"
           fi
 
-      # ─── 2. Récupérer le JSON source depuis branche `captures` ────────────
-      - name: Récupérer incidents_<DATE>.json depuis branche captures
+      # ─── 2. Récupérer le JSON source depuis tomtom-data-prod/captures-prod ─
+      - name: Récupérer incidents_<DATE>.json depuis le repo data privé
         if: env.REGEN_ONLY != 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
-          URL="https://raw.githubusercontent.com/${{ github.repository }}/captures/captures/${DATE}/incidents_${DATE}.json"
+          URL="https://raw.githubusercontent.com/${DATA_REPO}/${SOURCE_BRANCH}/captures/${DATE}/incidents_${DATE}.json"
           HTTP_CODE=$(curl -sL -o /tmp/incidents.json \
-            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Authorization: token ${DATA_REPO_TOKEN}" \
             -w "%{http_code}" "$URL" || echo "000")
 
           if [ "$HTTP_CODE" != "200" ] || [ ! -s /tmp/incidents.json ]; then
@@ -81,19 +85,19 @@ jobs:
           echo "LOCAL_SIZE=${LOCAL_SIZE}" >> $GITHUB_ENV
           echo "✓ Fichier récupéré (${LOCAL_SIZE} bytes)"
 
-      # ─── 3. Vérifier l'état de la branche `incidents-data` ────────────────
+      # ─── 3. Vérifier l'état de la branche cible ───────────────────────────
       - name: Vérifier état branche incidents-data
         if: env.REGEN_ONLY != 'true' && env.SOURCE_MISSING != 'true'
         env:
-          GH_TOKEN: ${{ secrets.MONITORING_STATS_PUSH_TOKEN }}
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
           BRANCH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: token ${GH_TOKEN}" \
-            "https://api.github.com/repos/ox30/monitoring-stats/branches/incidents-data")
+            -H "Authorization: token ${DATA_REPO_TOKEN}" \
+            "https://api.github.com/repos/${DATA_REPO}/branches/${TARGET_BRANCH}")
 
           if [ "$BRANCH_STATUS" = "200" ]; then
-            EXISTING=$(curl -s -H "Authorization: token ${GH_TOKEN}" \
-              "https://api.github.com/repos/ox30/monitoring-stats/contents/incidents_${DATE}.json?ref=incidents-data")
+            EXISTING=$(curl -s -H "Authorization: token ${DATA_REPO_TOKEN}" \
+              "https://api.github.com/repos/${DATA_REPO}/contents/incidents_${DATE}.json?ref=${TARGET_BRANCH}")
             REMOTE_SIZE=$(echo "$EXISTING" | python3 -c "
           import sys, json
           try:
@@ -106,7 +110,7 @@ jobs:
             echo "✓ Branche existante — fichier remote = ${REMOTE_SIZE} bytes"
           else
             echo "REMOTE_SIZE=0" >> $GITHUB_ENV
-            echo "ℹ Branche incidents-data inexistante — sera créée"
+            echo "ℹ Branche ${TARGET_BRANCH} inexistante — sera créée"
           fi
 
       # ─── 4. Marquer si publish nécessaire ─────────────────────────────────
@@ -121,26 +125,26 @@ jobs:
             echo "NEEDS_PUBLISH=true" >> $GITHUB_ENV
           fi
 
-      # ─── 5. Cloner monitoring-stats ───────────────────────────────────────
-      - name: Cloner monitoring-stats
+      # ─── 5. Cloner le repo data ───────────────────────────────────────────
+      - name: Cloner tomtom-data-prod
         if: env.SOURCE_MISSING != 'true'
         env:
-          GH_TOKEN: ${{ secrets.MONITORING_STATS_PUSH_TOKEN }}
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
           git clone --depth 1 \
-            https://x-access-token:${GH_TOKEN}@github.com/ox30/monitoring-stats.git \
-            /tmp/ms 2>&1 | sed 's/${GH_TOKEN}/***/g'
+            "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" \
+            /tmp/ms 2>&1 | sed "s/${DATA_REPO_TOKEN}/***/g"
           cd /tmp/ms
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          if git ls-remote --heads origin incidents-data | grep -q incidents-data; then
-            echo "✓ Branche incidents-data existe — checkout"
-            git fetch origin incidents-data:incidents-data
-            git checkout incidents-data
+          if git ls-remote --heads origin "${TARGET_BRANCH}" | grep -q "${TARGET_BRANCH}"; then
+            echo "✓ Branche ${TARGET_BRANCH} existe — checkout"
+            git fetch origin "${TARGET_BRANCH}:${TARGET_BRANCH}"
+            git checkout "${TARGET_BRANCH}"
           else
-            echo "🌱 Création de la branche orpheline incidents-data"
-            git checkout --orphan incidents-data
+            echo "🌱 Création de la branche orpheline ${TARGET_BRANCH}"
+            git checkout --orphan "${TARGET_BRANCH}"
             git rm -rf . 2>/dev/null || true
             cat > README.md << 'README_EOF'
           # incidents-data
@@ -168,11 +172,11 @@ jobs:
       - name: Cloner pour REGEN_ONLY
         if: env.REGEN_ONLY == 'true'
         env:
-          GH_TOKEN: ${{ secrets.MONITORING_STATS_PUSH_TOKEN }}
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
-          git clone --depth 1 --branch incidents-data \
-            https://x-access-token:${GH_TOKEN}@github.com/ox30/monitoring-stats.git \
-            /tmp/ms 2>&1 | sed "s/${GH_TOKEN}/***/g"
+          git clone --depth 1 --branch "${TARGET_BRANCH}" \
+            "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" \
+            /tmp/ms 2>&1 | sed "s/${DATA_REPO_TOKEN}/***/g"
           cd /tmp/ms
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -234,13 +238,13 @@ jobs:
           git commit -m "$MSG"
 
           for i in 1 2; do
-            if git push origin incidents-data; then
+            if git push origin "${TARGET_BRANCH}"; then
               echo "✓ Push réussi (tentative $i/2)"
               echo "PUSHED=true" >> $GITHUB_ENV
               break
             else
               echo "⚠ Push échoué (tentative $i/2) — pull rebase + retry"
-              git pull --rebase origin incidents-data 2>/dev/null || true
+              git pull --rebase origin "${TARGET_BRANCH}" 2>/dev/null || true
               sleep 10
             fi
           done

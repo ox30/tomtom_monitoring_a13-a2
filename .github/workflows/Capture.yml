@@ -1,5 +1,14 @@
 name: TomTom Traffic Capture (Vector Flow)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PROD — pousse les captures vers le repo privé tomtom-data-prod
+# Branche cible : captures-prod (orpheline)
+# Prérequis secrets :
+#   - TOMTOM_API_KEY      : clé API TomTom
+#   - DATA_REPO_TOKEN     : Fine-grained PAT avec Contents:write sur tomtom-data-prod
+#   - NTFY_TOPIC_URL      : URL https://ntfy.sh/<topic> prod (optionnel)
+# ─────────────────────────────────────────────────────────────────────────────
+
 on:
   schedule:
     - cron: '*/5 * * * *'
@@ -30,16 +39,28 @@ on:
           - "light"
           - "main"
           - "night"
+      verbose:
+        description: "Logs verbeux (détails par zone, budget API, coords GPS)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 concurrency:
   group: tomtom-capture
   cancel-in-progress: false
 
+env:
+  DATA_REPO: ox30/tomtom-data-prod
+  DATA_BRANCH: captures-prod
+
 jobs:
   capture-loop:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     timeout-minutes: 370
 
     steps:
@@ -47,6 +68,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          persist-credentials: false  # ← critique : empêche l'extraheader qui override notre PAT
 
       - name: Sauvegarder les fichiers de travail
         run: |
@@ -56,12 +78,29 @@ jobs:
           cp incidents_export.py /tmp/incidents_export.py 2>/dev/null || true
           cp requirements.txt /tmp/requirements.txt 2>/dev/null || true
 
-      - name: Restaurer les données existantes
+      - name: Configurer le remote data (repo privé)
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
-          git fetch origin captures --depth=1 2>/dev/null && \
-          git checkout origin/captures -- captures/ bases/ 2>/dev/null && \
-          echo "✓ Données précédentes restaurées" || \
-          echo "→ Première exécution"
+          if [ -z "$DATA_REPO_TOKEN" ]; then
+            echo "❌ DATA_REPO_TOKEN manquant — abandon"
+            exit 1
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add data "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git"
+          echo "✓ Remote 'data' configuré → ${DATA_REPO}"
+
+      - name: Restaurer les données existantes depuis le repo data
+        run: |
+          # Tenter de récupérer la branche captures-prod (peut ne pas exister la 1ère fois)
+          if git fetch data "${DATA_BRANCH}" --depth=1 2>/dev/null; then
+            git checkout "data/${DATA_BRANCH}" -- captures/ bases/ 2>/dev/null && \
+              echo "✓ Données précédentes restaurées depuis data/${DATA_BRANCH}" || \
+              echo "→ Branche ${DATA_BRANCH} existe mais pas de captures/ ni bases/"
+          else
+            echo "→ Branche ${DATA_BRANCH} inexistante (première exécution)"
+          fi
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -79,6 +118,7 @@ jobs:
           MAX_CYCLES: ${{ github.event.inputs.cycles || '0' }}
           INCIDENTS_ENABLED: ${{ github.event.inputs.incidents || 'true' }}
           BASE_MAP_STYLE: ${{ github.event.inputs.map_style || 'night' }}
+          VERBOSE_LOGS: ${{ github.event.inputs.verbose == 'true' && '1' || '0' }}
         run: |
           set -euo pipefail
 
@@ -90,7 +130,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # ── Préparer la branche captures (propre) ──────────────
+          # ── Préparer la branche captures-work (propre) ──────────
           # Sauvegarder les données existantes
           cp -r captures/ /tmp/captures 2>/dev/null || true
           cp -r bases/ /tmp/bases 2>/dev/null || true
@@ -102,58 +142,42 @@ jobs:
           # Supprimer TOUT du working directory
           find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
 
-          # Restaurer UNIQUEMENT ce qu'on veut sur la branche captures
+          # Restaurer UNIQUEMENT ce qu'on veut sur la branche captures-prod
           cp /tmp/capture.py capture.py
           cp /tmp/config.py config.py
           cp /tmp/incidents_export.py incidents_export.py 2>/dev/null || true
           cp -r /tmp/captures captures 2>/dev/null || mkdir -p captures
           cp -r /tmp/bases bases 2>/dev/null || mkdir -p bases
 
-          # README pour la branche captures
+          # README pour la branche captures-prod
           cat > README.md << 'EOF'
-          # Captures TomTom — Trafic A13/A2
+          # Captures TomTom — Trafic A13/A2 (PROD)
 
-          Captures automatiques (flow vectoriel + incidents) toutes les ~10 minutes.
+          Branche orpheline de stockage des captures automatiques.
+          Repo PRIVÉ — accès restreint aux ayants droit.
+
+          Captures toutes les ~10 minutes (flow vectoriel + incidents).
           Fuseau horaire : **Europe/Zurich** (CET/CEST).
-
-          ## Télécharger
-
-          | Quoi | Comment |
-          |---|---|
-          | **Une capture** | Naviguer dans les dossiers ci-dessous → clic sur l'image → bouton ↓ **Download** |
-          | **Tout télécharger (ZIP)** | [📦 Télécharger le ZIP](https://github.com/ox30/tomtom_monitoring_a13-a2/archive/refs/heads/captures.zip) |
 
           ## Structure
 
           ```
           captures/                                    ← composites toutes les 10 min
-            2026-03-29/
-              zone_A13_Chur/
-                2026-03-29-0830_zone_A13_Chur.jpg      ← heure locale Zurich
-                ...
-              zone_Chur_Isla-T/
-                ...
-              zone_globale_A2_A13/
-                ...
-
-          bases/                                       ← cartes de fond (1× par run)
-            2026-03-29/
-              zone_A13_Chur/
-                2026-03-29-0600_zone_A13_Chur_base.jpg
-              ...
+            YYYY-MM-DD/
+              <zone_name>/
+                YYYYMMDDhhmm_<zone_name>.jpg
+              incidents_YYYY-MM-DD.json                ← liste des incidents du jour
+              capture_errors.json                      ← erreurs partielles
+          bases/                                       ← cartes de base 1× par run
+            YYYY-MM-DD/
+              <zone_name>/
+                base_YYYYMMDD_<zone_name>.jpg
           ```
-
-          ## Zones capturées
-
-          | Zone | Couverture |
-          |---|---|
-          | `zone_globale_A2_A13` | Vue d'ensemble A2–A13 |
-          | `zone_A13_Chur` | Secteur A13 autour de Chur |
-          | `zone_Chur_Isla-T` | Détail Chur – Isla/Thusis |
 
           ## Rétention
 
           Les captures et bases de plus de **7 jours** sont automatiquement supprimées.
+          Archivage long terme via Proton Drive (Archive.yml).
           EOF
           sed -i 's/^          //' README.md
 
@@ -162,7 +186,7 @@ jobs:
           git add bases/ 2>/dev/null || true
           git commit --allow-empty -m "captures init"
 
-          echo "✓ Branche captures prête (contenu : README.md, captures/, bases/)"
+          echo "✓ Branche captures-work prête (contenu : README.md, captures/, bases/)"
           ls -la
 
           # ── Sauvegarder les cartes de base (1× par run) ──────
@@ -175,8 +199,8 @@ jobs:
           git add captures/ 2>/dev/null || true
           git add bases/ 2>/dev/null || true
           git commit --amend --allow-empty -m "captures $(TZ=Europe/Zurich date '+%Y-%m-%d %H:%M %Z')" -q
-          git push --force origin captures-work:captures -q || \
-            (echo "⚠ Push échoué — retry dans 10s..." && sleep 10 && git push --force origin captures-work:captures -q) || \
+          git push --force data "captures-work:${DATA_BRANCH}" -q || \
+            (echo "⚠ Push échoué — retry dans 10s..." && sleep 10 && git push --force data "captures-work:${DATA_BRANCH}" -q) || \
             echo "⚠ Push bases échoué (2 tentatives) — on continue"
           echo "✓ Bases sauvegardées"
 
@@ -213,8 +237,8 @@ jobs:
             git add captures/ 2>/dev/null || true
             git add bases/ 2>/dev/null || true
             git commit --amend --allow-empty -m "captures $(TZ=Europe/Zurich date '+%Y-%m-%d %H:%M %Z')" -q
-            git push --force origin captures-work:captures -q || \
-              (echo "⚠ Push échoué — retry dans 10s..." && sleep 10 && git push --force origin captures-work:captures -q) || \
+            git push --force data "captures-work:${DATA_BRANCH}" -q || \
+              (echo "⚠ Push échoué — retry dans 10s..." && sleep 10 && git push --force data "captures-work:${DATA_BRANCH}" -q) || \
               echo "⚠ Push échoué (2 tentatives) — données conservées pour le prochain cycle"
 
             CYCLE_END=$(date +%s)

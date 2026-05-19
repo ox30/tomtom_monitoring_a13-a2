@@ -1,0 +1,203 @@
+name: One-shot — Migrer historique captures prod → tomtom-data-prod (v2)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Migration ONE-SHOT PROD (v2 — split par jour pour éviter HTTP 500 sur gros push)
+#
+# Stratégie simplifiée :
+#  1. Clone branche `captures` du public
+#  2. Clone branche `captures-dev` du privé
+#  3. Pour chaque date présente dans public/captures/ :
+#       - écraser captures/{date}/ et bases/{date}/ dans le privé
+#       - git add, commit, push
+#     → 1 commit + 1 push par jour, ~600 MB par push (gérable par GitHub)
+#  4. Si un push plante, les jours précédents sont déjà sauvegardés.
+#     Relancer le workflow → reprend là où ça s'est arrêté (idempotent).
+#
+# Concurrence : même group que Capture.yml pour éviter les collisions.
+#
+# À supprimer une fois la migration faite.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: tomtom-capture
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: ox30/tomtom_monitoring_a13-a2
+  SOURCE_BRANCH: captures
+  TARGET_REPO: ox30/tomtom-data-prod
+  TARGET_BRANCH: captures-prod
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Timeout généreux : ~3 min par jour × ~10 jours = 30 min, on prend large
+    timeout-minutes: 60
+
+    steps:
+      # ─────────────────────────────────────────────────────────────────────
+      - name: "1/4 — Cloner branche captures du repo public"
+        run: |
+          echo "Clone : ${SOURCE_REPO} branche ${SOURCE_BRANCH}"
+          git clone --depth 1 --branch "${SOURCE_BRANCH}" \
+            "https://github.com/${SOURCE_REPO}.git" /tmp/public
+
+          CAP_FILES=$(find /tmp/public/captures -name "*.jpg" 2>/dev/null | wc -l)
+          BASE_FILES=$(find /tmp/public/bases -name "*.jpg" 2>/dev/null | wc -l)
+          JSON_FILES=$(find /tmp/public/captures -name "*.json" 2>/dev/null | wc -l)
+
+          echo ""
+          echo "Source publique :"
+          echo "  Captures JPG : ${CAP_FILES}"
+          echo "  Bases JPG    : ${BASE_FILES}"
+          echo "  JSON         : ${JSON_FILES}"
+
+          # Lister les dates
+          DATES=$(ls /tmp/public/captures/ 2>/dev/null | sort)
+          if [ -z "$DATES" ]; then
+            echo "⚠ Aucune date trouvée dans /tmp/public/captures/"
+            echo "NOTHING_TO_MIGRATE=true" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          echo ""
+          echo "Dates détectées :"
+          echo "$DATES" | sed 's/^/  /'
+
+          # Stocker la liste pour le step suivant
+          echo "$DATES" > /tmp/dates_to_migrate.txt
+
+      # ─────────────────────────────────────────────────────────────────────
+      - name: "2/4 — Cloner branche captures-dev du repo privé"
+        if: env.NOTHING_TO_MIGRATE != 'true'
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          echo "Clone : ${TARGET_REPO} branche ${TARGET_BRANCH}"
+          git clone --depth 1 --branch "${TARGET_BRANCH}" \
+            "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${TARGET_REPO}.git" \
+            /tmp/private 2>&1 | sed "s|${DATA_REPO_TOKEN}|***|g"
+
+          cd /tmp/private
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Configurer git pour permettre des gros pushes (HTTP buffer)
+          git config http.postBuffer 524288000   # 500 MB
+          git config http.lowSpeedLimit 1000
+          git config http.lowSpeedTime 600       # 10 min de tolérance bas débit
+
+          BEFORE_CAP=$(find captures -name "*.jpg" 2>/dev/null | wc -l)
+          BEFORE_BASE=$(find bases -name "*.jpg" 2>/dev/null | wc -l)
+          echo ""
+          echo "État actuel de captures-dev (privé) avant migration :"
+          echo "  Captures JPG : ${BEFORE_CAP}"
+          echo "  Bases JPG    : ${BEFORE_BASE}"
+          echo ""
+          echo "→ Ce contenu sera ÉCRASÉ par les données du public."
+
+      # ─────────────────────────────────────────────────────────────────────
+      - name: "3/4 — Migrer date par date (1 commit + 1 push / jour)"
+        if: env.NOTHING_TO_MIGRATE != 'true'
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          cd /tmp/private
+
+          DATES=$(cat /tmp/dates_to_migrate.txt)
+          TOTAL=$(echo "$DATES" | wc -l)
+          INDEX=0
+          SUCCESS=0
+          FAILED=0
+
+          for DATE in $DATES; do
+            INDEX=$((INDEX + 1))
+            echo ""
+            echo "═══════════════════════════════════════════════════════════"
+            echo " [${INDEX}/${TOTAL}] Migration de ${DATE}"
+            echo "═══════════════════════════════════════════════════════════"
+
+            # Supprimer l'existant du jour dans le privé (on écrase)
+            rm -rf "captures/${DATE}" "bases/${DATE}"
+
+            # Copier depuis le public
+            if [ -d "/tmp/public/captures/${DATE}" ]; then
+              mkdir -p "captures"
+              cp -r "/tmp/public/captures/${DATE}" "captures/${DATE}"
+              CAP_COUNT=$(find "captures/${DATE}" -name "*.jpg" 2>/dev/null | wc -l)
+              JSON_COUNT=$(find "captures/${DATE}" -name "*.json" 2>/dev/null | wc -l)
+            else
+              CAP_COUNT=0
+              JSON_COUNT=0
+            fi
+
+            if [ -d "/tmp/public/bases/${DATE}" ]; then
+              mkdir -p "bases"
+              cp -r "/tmp/public/bases/${DATE}" "bases/${DATE}"
+              BASE_COUNT=$(find "bases/${DATE}" -name "*.jpg" 2>/dev/null | wc -l)
+            else
+              BASE_COUNT=0
+            fi
+
+            SIZE=$(du -sh "captures/${DATE}" 2>/dev/null | cut -f1)
+            echo "  Captures JPG : ${CAP_COUNT}"
+            echo "  Bases JPG    : ${BASE_COUNT}"
+            echo "  JSON         : ${JSON_COUNT}"
+            echo "  Taille       : ${SIZE}"
+
+            # Add + commit
+            git add "captures/${DATE}" "bases/${DATE}" 2>/dev/null || true
+
+            if git diff --cached --quiet; then
+              echo "  ✓ Aucun changement effectif — skip"
+              continue
+            fi
+
+            git commit -q -m "📥 Import ${DATE} (${CAP_COUNT} captures, ${BASE_COUNT} bases, ${JSON_COUNT} JSON)"
+            echo "  ✓ Commit créé"
+
+            # Push avec retry (3 tentatives)
+            PUSHED=false
+            for i in 1 2 3; do
+              echo "  Push (tentative ${i}/3)..."
+              if git push origin "${TARGET_BRANCH}" 2>&1 | sed "s|${DATA_REPO_TOKEN}|***|g"; then
+                echo "  ✅ Push réussi"
+                PUSHED=true
+                SUCCESS=$((SUCCESS + 1))
+                break
+              else
+                echo "  ⚠ Push échoué (tentative ${i}/3)"
+                if [ $i -lt 3 ]; then
+                  sleep 15
+                fi
+              fi
+            done
+
+            if [ "$PUSHED" = "false" ]; then
+              echo "  ❌ Push de ${DATE} échoué après 3 tentatives — abandon."
+              echo "     Les dates précédentes sont déjà sauvegardées."
+              echo "     Relance le workflow pour reprendre."
+              FAILED=$((FAILED + 1))
+              break
+            fi
+          done
+
+          echo ""
+          echo "═══════════════════════════════════════════════════════════"
+          echo " Bilan migration"
+          echo "═══════════════════════════════════════════════════════════"
+          echo "  Dates traitées avec succès : ${SUCCESS} / ${TOTAL}"
+          if [ "$FAILED" -gt 0 ]; then
+            echo "  Échecs : ${FAILED}"
+            exit 1
+          fi
+
+      # ─────────────────────────────────────────────────────────────────────
+      - name: "4/4 — Cleanup"
+        if: always()
+        run: rm -rf /tmp/public /tmp/private /tmp/dates_to_migrate.txt

@@ -1,8 +1,18 @@
 name: Archive to Proton Drive
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PROD — archive les captures depuis le repo PRIVÉ tomtom-data-prod
+# Source : tomtom-data-prod / captures-prod
+# Journal : tomtom-data-prod / main / archive_log.json
+# Prérequis secrets :
+#   - DATA_REPO_TOKEN     : Fine-grained PAT avec Contents:write sur tomtom-data-prod
+#   - RCLONE_CONFIG_BASE64 : config rclone vers Proton Drive
+#   - NTFY_TOPIC_URL      : URL ntfy prod (optionnel)
+# ─────────────────────────────────────────────────────────────────────────────
+
 on:
   schedule:
-    # Chaque nuit à 2h00 UTC (4h00 CEST)
+    # 4 déclenchements par jour pour la fiabilité (cron GitHub Actions peu fiable la nuit)
     - cron: '0 2 * * *'
     - cron: '0 8 * * *'
     - cron: '0 14 * * *'
@@ -18,11 +28,15 @@ on:
         required: false
         default: "3"
 
+env:
+  DATA_REPO: ox30/tomtom-data-prod
+  DATA_BRANCH: captures-prod
+
 jobs:
   archive:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
 
     steps:
       - name: Déterminer la date
@@ -35,10 +49,12 @@ jobs:
           echo "RETENTION=${{ github.event.inputs.retention_days || '3' }}" >> $GITHUB_ENV
           echo "TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
 
-      - name: Checkout branche captures
+      - name: Checkout branche captures depuis repo data privé
         uses: actions/checkout@v4
         with:
-          ref: captures
+          repository: ${{ env.DATA_REPO }}
+          ref: ${{ env.DATA_BRANCH }}
+          token: ${{ secrets.DATA_REPO_TOKEN }}
           fetch-depth: 1
 
       - name: Vérifier que le dossier existe
@@ -159,26 +175,44 @@ jobs:
             --progress --stats-one-line
           echo "✓ Journal synchronisé sur Proton Drive"
 
-      - name: Publier le journal sur GitHub (main)
+      - name: Publier le journal sur le repo data privé (main)
+        env:
+          DATA_REPO_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
-          # Créer une branche locale basée sur main
-          git fetch origin main --depth=1
-          git checkout -b update-log origin/main
+          # Cloner la branche main du repo data dans /tmp/data-main
+          git clone --depth 1 --branch main \
+            "https://x-access-token:${DATA_REPO_TOKEN}@github.com/${DATA_REPO}.git" \
+            /tmp/data-main 2>&1 | sed "s/${DATA_REPO_TOKEN}/***/g"
 
-          # Copier le journal
-          cp /tmp/log/archive_log.json archive_log.json
-
+          cd /tmp/data-main
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add archive_log.json
-          git diff --cached --quiet && echo "Pas de changement" || \
-            (git commit -m "📋 Archive log — ${{ env.DATE }}" && \
-             git push origin update-log:main)
+          # Copier le journal mis à jour
+          cp /tmp/log/archive_log.json archive_log.json
 
-      - name: Nettoyage rclone config
+          git add archive_log.json
+          if git diff --cached --quiet; then
+            echo "✓ Pas de changement du journal"
+          else
+            git commit -m "📋 Archive log — ${{ env.DATE }}"
+            for i in 1 2; do
+              if git push origin main; then
+                echo "✓ Journal poussé sur ${DATA_REPO}/main (tentative $i/2)"
+                break
+              else
+                echo "⚠ Push échoué (tentative $i/2) — pull rebase + retry"
+                git pull --rebase origin main 2>/dev/null || true
+                sleep 10
+              fi
+            done
+          fi
+
+      - name: Nettoyage rclone config + clone
         if: always()
-        run: rm -f ~/.config/rclone/rclone.conf
+        run: |
+          rm -f ~/.config/rclone/rclone.conf
+          rm -rf /tmp/data-main
 
       - name: Résumé
         run: |
